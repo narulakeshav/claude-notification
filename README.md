@@ -12,6 +12,8 @@ Built because `terminal-notifier`'s `-sender` and `-appIcon` flags are [broken o
 - Project name in the title (e.g. "Claude Code · my-project")
 - Sound alerts
 
+![Install](install.png)
+
 ## Install
 
 ```bash
