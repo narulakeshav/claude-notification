@@ -81,6 +81,8 @@ let body: String = {
             return hookInput?.message ?? "Needs your permission"
         case "idle_prompt":
             return "Waiting for your input"
+        case "stop":
+            return "Finished working"
         default:
             return hookInput?.message ?? "Needs your attention"
         }
@@ -97,6 +99,11 @@ let title: String = {
 }()
 
 // ── Send notification ───────────────────────────────────────────────────
+// Only send if we have actual input (stdin or CLI args).
+// When macOS relaunches the app to handle a notification click,
+// there's no input — so we skip sending to avoid an infinite loop.
+
+let hasInput = hookInput != nil || CommandLine.arguments.count > 1
 
 let app = NSApplication.shared
 let delegate = NotificationDelegate()
@@ -110,20 +117,24 @@ center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
 }
 semaphore.wait()
 
-let content = UNMutableNotificationContent()
-content.title = title
-content.body = body
-content.sound = .default
+if hasInput {
+    let content = UNMutableNotificationContent()
+    content.title = title
+    content.body = body
+    content.sound = .default
 
-let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-center.add(request) { error in
-    if let error = error {
-        fputs("Error: \(error.localizedDescription)\n", stderr)
-        exit(1)
+    let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+    center.add(request) { error in
+        if let error = error {
+            fputs("Error: \(error.localizedDescription)\n", stderr)
+        }
     }
-}
 
-DispatchQueue.main.asyncAfter(deadline: .now() + 30.0) {
-    NSApplication.shared.terminate(nil)
+    // Stay alive for 30s to handle notification clicks (focus terminal)
+    DispatchQueue.main.asyncAfter(deadline: .now() + 30.0) {
+        NSApplication.shared.terminate(nil)
+    }
+    app.run()
+} else {
+    exit(0)
 }
-app.run()

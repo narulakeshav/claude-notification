@@ -12,6 +12,7 @@ const MACOS_DIR = path.join(APP_PATH, "Contents", "MacOS");
 const RESOURCES_DIR = path.join(APP_PATH, "Contents", "Resources");
 const CONFIG_PATH = path.join(HOME, ".claude-notify.json");
 const SWIFT_SRC = path.join(__dirname, "..", "src", "notify.swift");
+const STOP_HOOK_SRC = path.join(__dirname, "..", "src", "stop-hook.sh");
 const SETTINGS_PATH = path.join(HOME, ".claude", "settings.json");
 const VERSION = require("../package.json").version;
 
@@ -242,6 +243,11 @@ async function install() {
     process.exit(1);
   }
 
+  // Copy stop hook script
+  const stopHookDest = path.join(MACOS_DIR, "stop-hook.sh");
+  fs.copyFileSync(STOP_HOOK_SRC, stopHookDest);
+  fs.chmodSync(stopHookDest, 0o755);
+
   // Step 3: Sign & Register
   log();
   hr();
@@ -267,10 +273,11 @@ async function install() {
   log();
 
   const hookCommand = `pkill -f ClaudeNotify.app/Contents/MacOS/notify 2>/dev/null; ${MACOS_DIR}/notify 'Claude Code'`;
+  const stopHookCommand = `${MACOS_DIR}/stop-hook.sh`;
 
   const autoConfig = await ask(`Auto-configure Claude Code hooks? ${c.dim}(Y/n)${c.reset} `);
   if (autoConfig.toLowerCase() !== "n") {
-    configureHook(hookCommand);
+    configureHook(hookCommand, stopHookCommand);
     done("Updated ~/.claude/settings.json");
   } else {
     log();
@@ -281,6 +288,10 @@ async function install() {
     console.log(`  ${c.dim}    "Notification": [{${c.reset}`);
     console.log(`  ${c.dim}      "matcher": "*",${c.reset}`);
     console.log(`  ${c.dim}      "hooks": [{ "type": "command", "command": "${hookCommand}" }]${c.reset}`);
+    console.log(`  ${c.dim}    }],${c.reset}`);
+    console.log(`  ${c.dim}    "Stop": [{${c.reset}`);
+    console.log(`  ${c.dim}      "matcher": "*",${c.reset}`);
+    console.log(`  ${c.dim}      "hooks": [{ "type": "command", "command": "${stopHookCommand}" }]${c.reset}`);
     console.log(`  ${c.dim}    }]${c.reset}`);
     console.log(`  ${c.dim}  }${c.reset}`);
     console.log(`  ${c.dim}}${c.reset}`);
@@ -301,14 +312,14 @@ async function install() {
   info("1. Enable notifications: System Settings → Notifications → Claude Notification");
   info(`2. Test it: ${c.white}npx claude-notification test${c.reset}`);
   log();
-  info(`${c.dim}Notifications will show the Claude icon, your project name,${c.reset}`);
-  info(`${c.dim}and what Claude needs — click to jump back to ${terminal.name}.${c.reset}`);
+  info(`${c.dim}You'll get notified when Claude needs input${c.reset}`);
+  info(`${c.dim}and when it finishes working — click to jump back to ${terminal.name}.${c.reset}`);
   log();
 }
 
 // ── Auto-configure hook ─────────────────────────────────────────────────
 
-function configureHook(hookCommand) {
+function configureHook(hookCommand, stopHookCommand) {
   let settings = {};
   if (fs.existsSync(SETTINGS_PATH)) {
     settings = JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf-8"));
@@ -319,8 +330,14 @@ function configureHook(hookCommand) {
   if (!settings.hooks) settings.hooks = {};
   settings.hooks.Notification = [
     {
-      matcher: "*",
+      matcher: "permission_prompt",
       hooks: [{ type: "command", command: hookCommand }],
+    },
+  ];
+  settings.hooks.Stop = [
+    {
+      matcher: "*",
+      hooks: [{ type: "command", command: stopHookCommand }],
     },
   ];
 
@@ -345,14 +362,20 @@ function uninstall() {
 
   if (fs.existsSync(SETTINGS_PATH)) {
     const settings = JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf-8"));
-    if (settings.hooks?.Notification) {
-      settings.hooks.Notification = settings.hooks.Notification.filter(
-        (n) => !n.hooks?.some((h) => h.command?.includes("ClaudeNotify"))
-      );
-      if (settings.hooks.Notification.length === 0) delete settings.hooks.Notification;
-      if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
+    let removed = false;
+    for (const hookType of ["Notification", "Stop"]) {
+      if (settings.hooks?.[hookType]) {
+        settings.hooks[hookType] = settings.hooks[hookType].filter(
+          (n) => !n.hooks?.some((h) => h.command?.includes("ClaudeNotify"))
+        );
+        if (settings.hooks[hookType].length === 0) delete settings.hooks[hookType];
+        removed = true;
+      }
+    }
+    if (settings.hooks && Object.keys(settings.hooks).length === 0) delete settings.hooks;
+    if (removed) {
       fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n");
-      done("Removed hook from ~/.claude/settings.json");
+      done("Removed hooks from ~/.claude/settings.json");
     }
   }
 
