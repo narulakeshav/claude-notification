@@ -1,6 +1,6 @@
 {
   "name": "claude-notification",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Native macOS notifications for Claude Code — with custom icon, click-to-focus terminal, and contextual messages",
   "bin": {
     "claude-notification": "bin/cli.js"

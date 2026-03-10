@@ -13,6 +13,78 @@ const RESOURCES_DIR = path.join(APP_PATH, "Contents", "Resources");
 const CONFIG_PATH = path.join(HOME, ".claude-notify.json");
 const SWIFT_SRC = path.join(__dirname, "..", "src", "notify.swift");
 const SETTINGS_PATH = path.join(HOME, ".claude", "settings.json");
+const VERSION = require("../package.json").version;
+
+// ── Colors ──────────────────────────────────────────────────────────────
+
+const c = {
+  reset: "\x1b[0m",
+  bold: "\x1b[1m",
+  dim: "\x1b[2m",
+  orange: "\x1b[38;5;208m",
+  peach: "\x1b[38;5;216m",
+  green: "\x1b[38;5;114m",
+  red: "\x1b[38;5;203m",
+  gray: "\x1b[38;5;243m",
+  white: "\x1b[38;5;255m",
+  cyan: "\x1b[38;5;117m",
+  up: "\x1b[1A",
+  clearLine: "\x1b[2K",
+};
+
+const W = 52;
+
+function center(text, width) {
+  const vis = text.replace(/\x1b\[[0-9;]*m/g, "");
+  const left = Math.max(0, Math.floor((width - vis.length) / 2));
+  const right = Math.max(0, width - vis.length - left);
+  return " ".repeat(left) + text + " ".repeat(right);
+}
+
+const titleBar = `─── ${c.reset}${c.bold}${c.white}claude-notification${c.reset} ${c.dim}v${VERSION} `;
+const titleVis = `─── claude-notification v${VERSION} `;
+const titlePad = "─".repeat(Math.max(0, W - titleVis.length));
+
+const LOGO = `
+${c.dim}╭${titleBar}${titlePad}╮${c.reset}
+${c.dim}│${" ".repeat(W)}│${c.reset}
+${c.dim}│${c.reset}${center(`${c.peach}▐▛███▜▌${c.reset}`, W)}${c.dim}│${c.reset}
+${c.dim}│${c.reset}${center(`${c.peach}▝▜█████▛▘${c.reset}`, W)}${c.dim}│${c.reset}
+${c.dim}│${c.reset}${center(`${c.peach}▘▘ ▝▝${c.reset}`, W)}${c.dim}│${c.reset}
+${c.dim}│${" ".repeat(W)}│${c.reset}
+${c.dim}│${c.reset}${center(`${c.gray}Native macOS notifications for Claude Code${c.reset}`, W)}${c.dim}│${c.reset}
+${c.dim}│${c.reset}${center(`${c.dim}by Keshav Narula · x.com/narulakeshav${c.reset}`, W)}${c.dim}│${c.reset}
+${c.dim}╰${"─".repeat(W)}╯${c.reset}
+`;
+
+function log(msg = "") { console.log(`  ${msg}`); }
+function done(msg) { console.log(`  ${c.green}✓${c.reset} ${msg}`); }
+function warn(msg) { console.log(`  ${c.red}✗${c.reset} ${msg}`); }
+function info(msg) { console.log(`  ${c.gray}${msg}${c.reset}`); }
+function hr() { console.log(`  ${c.dim}${"─".repeat(44)}${c.reset}`); }
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// Spinner for long operations
+function spinner(msg) {
+  const frames = ["◐", "◓", "◑", "◒"];
+  let i = 0;
+  process.stdout.write(`  ${c.orange}${frames[0]}${c.reset} ${msg}`);
+  const id = setInterval(() => {
+    i = (i + 1) % frames.length;
+    process.stdout.write(`${c.up}${c.clearLine}\r  ${c.orange}${frames[i]}${c.reset} ${msg}\n`);
+  }, 120);
+  return {
+    stop(doneMsg) {
+      clearInterval(id);
+      process.stdout.write(`${c.up}${c.clearLine}\r  ${c.green}✓${c.reset} ${doneMsg}\n`);
+    },
+    fail(failMsg) {
+      clearInterval(id);
+      process.stdout.write(`${c.up}${c.clearLine}\r  ${c.red}✗${c.reset} ${failMsg}\n`);
+    },
+  };
+}
 
 // ── Terminal presets ────────────────────────────────────────────────────
 
@@ -31,7 +103,7 @@ const TERMINALS = {
 
 function ask(question) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise((resolve) => rl.question(question, (ans) => { rl.close(); resolve(ans.trim()); }));
+  return new Promise((resolve) => rl.question(`  ${c.orange}?${c.reset} ${question}`, (ans) => { rl.close(); resolve(ans.trim()); }));
 }
 
 function detectTerminal() {
@@ -45,53 +117,87 @@ function detectTerminal() {
   return null;
 }
 
-function findIcon() {
-  // Try Claude desktop app first
+function findIcon(terminalApp) {
+  // Prefer Claude desktop icon
   const claudeIcon = "/Applications/Claude.app/Contents/Resources/electron.icns";
-  if (fs.existsSync(claudeIcon)) return claudeIcon;
+  if (fs.existsSync(claudeIcon)) return { path: claudeIcon, source: "Claude" };
 
-  // Fallback: generic app icon
+  // Fallback: use selected terminal's icon
+  if (terminalApp) {
+    try {
+      const icnsFiles = execSync(`ls /Applications/${terminalApp}/Contents/Resources/*.icns 2>/dev/null`, { encoding: "utf-8" }).trim().split("\n");
+      if (icnsFiles[0]) return { path: icnsFiles[0], source: terminalApp.replace(".app", "") };
+    } catch {}
+  }
+
   return null;
+}
+
+// Notification preview card
+function showPreview(terminal) {
+  const project = path.basename(process.cwd());
+  log();
+  console.log(`  ${c.dim}╭──────────────────────────────────────────╮${c.reset}`);
+  console.log(`  ${c.dim}│${c.reset}  ${c.peach}▐▛▜▌${c.reset}  ${c.bold}${c.white}Claude Code · ${project}${c.reset}${" ".repeat(Math.max(0, 24 - project.length))}${c.dim}│${c.reset}`);
+  console.log(`  ${c.dim}│${c.reset}  ${c.peach}▝▜█▘${c.reset}  ${c.gray}Waiting for your input${c.reset}              ${c.dim}│${c.reset}`);
+  console.log(`  ${c.dim}╰──────────────────────────────────────────╯${c.reset}`);
+  info(`  Click → opens ${terminal.name}`);
 }
 
 // ── Install ─────────────────────────────────────────────────────────────
 
 async function install() {
-  console.log("\n  Claude Notify — Setup\n");
+  console.log(LOGO);
+  hr();
+  log();
 
-  // 1. Detect or ask terminal
+  // Step 1: Detect or ask terminal
+  log(`${c.dim}Step 1 of 4${c.reset}  ${c.white}Terminal${c.reset}`);
+  log();
+
   let terminalKey = detectTerminal();
   if (terminalKey) {
-    console.log(`  Detected terminal: ${TERMINALS[terminalKey].name}`);
-    const ok = await ask("  Use this? (Y/n) ");
+    done(`Detected ${c.bold}${c.white}${TERMINALS[terminalKey].name}${c.reset}`);
+    const ok = await ask(`Use ${TERMINALS[terminalKey].name}? ${c.dim}(Y/n)${c.reset} `);
     if (ok.toLowerCase() === "n") terminalKey = null;
   }
 
   if (!terminalKey) {
-    console.log("\n  Available terminals:");
-    Object.entries(TERMINALS).forEach(([key, val]) => {
-      console.log(`    ${key.padEnd(12)} ${val.name}`);
+    log();
+    const keys = Object.keys(TERMINALS);
+    keys.forEach((key, i) => {
+      const num = `${c.orange}${String(i + 1).padStart(2)}${c.reset}`;
+      const name = `${c.white}${TERMINALS[key].name}${c.reset}`;
+      console.log(`    ${num}  ${name}`);
     });
-    const choice = await ask("\n  Which terminal? ");
-    terminalKey = choice.toLowerCase();
+    log();
+    const choice = await ask(`Pick a terminal ${c.dim}(1-${keys.length})${c.reset}: `);
+    const idx = parseInt(choice, 10) - 1;
+    if (idx >= 0 && idx < keys.length) {
+      terminalKey = keys[idx];
+    } else {
+      terminalKey = choice.toLowerCase();
+    }
     if (!TERMINALS[terminalKey]) {
-      console.error(`  Unknown terminal: ${choice}`);
+      warn(`Unknown terminal: ${choice}`);
       process.exit(1);
     }
+    done(`Selected ${c.bold}${c.white}${TERMINALS[terminalKey].name}${c.reset}`);
   }
 
   const terminal = TERMINALS[terminalKey];
-  console.log(`\n  Setting up for ${terminal.name}...`);
-
-  // 2. Write config
   fs.writeFileSync(CONFIG_PATH, JSON.stringify({ terminalBundleId: terminal.bundleId }, null, 2) + "\n");
-  console.log("  Wrote ~/.claude-notify.json");
 
-  // 3. Create .app bundle
+  // Step 2: Build
+  log();
+  hr();
+  log();
+  log(`${c.dim}Step 2 of 4${c.reset}  ${c.white}Build${c.reset}`);
+  log();
+
   fs.mkdirSync(MACOS_DIR, { recursive: true });
   fs.mkdirSync(RESOURCES_DIR, { recursive: true });
 
-  // Info.plist
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -99,7 +205,7 @@ async function install() {
     <key>CFBundleIdentifier</key>
     <string>com.claude-notify.app</string>
     <key>CFBundleName</key>
-    <string>ClaudeNotify</string>
+    <string>Claude Notification</string>
     <key>CFBundleExecutable</key>
     <string>notify</string>
     <key>CFBundleIconFile</key>
@@ -114,64 +220,90 @@ async function install() {
 </plist>`;
   fs.writeFileSync(path.join(APP_PATH, "Contents", "Info.plist"), plist);
 
-  // Copy icon
-  const iconSrc = findIcon();
-  if (iconSrc) {
-    fs.copyFileSync(iconSrc, path.join(RESOURCES_DIR, "AppIcon.icns"));
-    console.log("  Using Claude icon");
+  const icon = findIcon(terminal.app);
+  if (icon) {
+    fs.copyFileSync(icon.path, path.join(RESOURCES_DIR, "AppIcon.icns"));
+    done(`Using ${icon.source} icon`);
   } else {
-    console.log("  No Claude desktop app found — using default icon");
+    info("No icon found — notifications will use default macOS icon");
   }
 
-  // 4. Compile Swift
-  console.log("  Compiling...");
+  const sp = spinner("Compiling native app...\n");
   try {
     execSync(`swiftc -o "${path.join(MACOS_DIR, "notify")}" "${SWIFT_SRC}" -framework Cocoa -framework UserNotifications`, {
       stdio: "pipe",
     });
+    sp.stop("Compiled");
   } catch (e) {
-    console.error("  Compilation failed. Make sure Xcode Command Line Tools are installed:");
-    console.error("  xcode-select --install");
+    sp.fail("Compilation failed");
+    log();
+    info("Make sure Xcode Command Line Tools are installed:");
+    info("  xcode-select --install");
     process.exit(1);
   }
 
-  // 5. Codesign
+  // Step 3: Sign & Register
+  log();
+  hr();
+  log();
+  log(`${c.dim}Step 3 of 4${c.reset}  ${c.white}Sign & Register${c.reset}`);
+  log();
+
   execSync(`codesign --force --deep --sign - "${APP_PATH}"`, { stdio: "pipe" });
-  console.log("  Signed (ad-hoc)");
+  done("Signed (ad-hoc)");
 
-  // 6. Register with LaunchServices
   execSync(`/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "${APP_PATH}"`, { stdio: "pipe" });
-  console.log("  Registered with macOS");
+  done("Registered with macOS");
 
-  // 7. Trigger first launch to prompt for notification permissions
-  console.log("\n  Requesting notification permission...");
   const child = spawn("open", [APP_PATH, "--args", "Claude Notify", "Setup complete"]);
   child.unref();
+  done("Notification permission requested");
 
-  // 8. Show hook config
+  // Step 4: Configure hook
+  log();
+  hr();
+  log();
+  log(`${c.dim}Step 4 of 4${c.reset}  ${c.white}Hook${c.reset}`);
+  log();
+
   const hookCommand = `pkill -f ClaudeNotify.app/Contents/MacOS/notify 2>/dev/null; ${MACOS_DIR}/notify 'Claude Code'`;
 
-  console.log("\n  Done! Now:\n");
-  console.log("  1. Allow notifications when macOS prompts (or enable in System Settings → Notifications → ClaudeNotify)");
-  console.log(`\n  2. Add this to ~/.claude/settings.json:\n`);
-  console.log(`  {`);
-  console.log(`    "hooks": {`);
-  console.log(`      "Notification": [{`);
-  console.log(`        "matcher": "*",`);
-  console.log(`        "hooks": [{`);
-  console.log(`          "type": "command",`);
-  console.log(`          "command": "${hookCommand}"`);
-  console.log(`        }]`);
-  console.log(`      }]`);
-  console.log(`    }`);
-  console.log(`  }`);
-
-  const autoConfig = await ask("\n  Auto-configure Claude Code hooks? (Y/n) ");
+  const autoConfig = await ask(`Auto-configure Claude Code hooks? ${c.dim}(Y/n)${c.reset} `);
   if (autoConfig.toLowerCase() !== "n") {
     configureHook(hookCommand);
+    done("Updated ~/.claude/settings.json");
+  } else {
+    log();
+    info("Add this to ~/.claude/settings.json:");
+    log();
+    console.log(`  ${c.dim}{${c.reset}`);
+    console.log(`  ${c.dim}  "hooks": {${c.reset}`);
+    console.log(`  ${c.dim}    "Notification": [{${c.reset}`);
+    console.log(`  ${c.dim}      "matcher": "*",${c.reset}`);
+    console.log(`  ${c.dim}      "hooks": [{ "type": "command", "command": "${hookCommand}" }]${c.reset}`);
+    console.log(`  ${c.dim}    }]${c.reset}`);
+    console.log(`  ${c.dim}  }${c.reset}`);
+    console.log(`  ${c.dim}}${c.reset}`);
   }
 
-  console.log("\n  All set!\n");
+  // Finale
+  log();
+  hr();
+  log();
+
+  showPreview(terminal);
+
+  log();
+  hr();
+  log();
+  console.log(`  ${c.orange}◆${c.reset} ${c.bold}${c.white}You're all set!${c.reset}`);
+  log();
+  info("1. Enable notifications: System Settings → Notifications → Claude Notification");
+  info(`2. Test it: ${c.white}npx claude-notification test${c.reset}`);
+  log();
+  info(`${c.dim}Notifications will show the Claude icon, your project name,${c.reset}`);
+  info(`${c.dim}and what Claude needs — click to jump back to ${terminal.name}.${c.reset}`);
+  log();
 }
 
 // ── Auto-configure hook ─────────────────────────────────────────────────
@@ -193,24 +325,24 @@ function configureHook(hookCommand) {
   ];
 
   fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n");
-  console.log("  Updated ~/.claude/settings.json");
 }
 
 // ── Uninstall ───────────────────────────────────────────────────────────
 
 function uninstall() {
-  console.log("\n  Removing Claude Notify...\n");
+  console.log(LOGO);
+  hr();
+  log();
 
   if (fs.existsSync(APP_PATH)) {
     fs.rmSync(APP_PATH, { recursive: true });
-    console.log("  Removed ~/Applications/ClaudeNotify.app");
+    done("Removed ~/Applications/ClaudeNotify.app");
   }
   if (fs.existsSync(CONFIG_PATH)) {
     fs.unlinkSync(CONFIG_PATH);
-    console.log("  Removed ~/.claude-notify.json");
+    done("Removed ~/.claude-notify.json");
   }
 
-  // Remove hook from settings
   if (fs.existsSync(SETTINGS_PATH)) {
     const settings = JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf-8"));
     if (settings.hooks?.Notification) {
@@ -220,18 +352,20 @@ function uninstall() {
       if (settings.hooks.Notification.length === 0) delete settings.hooks.Notification;
       if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
       fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n");
-      console.log("  Removed hook from ~/.claude/settings.json");
+      done("Removed hook from ~/.claude/settings.json");
     }
   }
 
-  console.log("\n  Done!\n");
+  log();
+  console.log(`  ${c.orange}◆${c.reset} ${c.bold}${c.white}Uninstalled.${c.reset} ${c.dim}Thanks for trying claude-notification!${c.reset}`);
+  log();
 }
 
 // ── Test ────────────────────────────────────────────────────────────────
 
 function test() {
   if (!fs.existsSync(path.join(MACOS_DIR, "notify"))) {
-    console.error("  Not installed. Run: npx claude-notification install");
+    warn(`Not installed. Run: ${c.white}npx claude-notification install${c.reset}`);
     process.exit(1);
   }
 
@@ -241,13 +375,19 @@ function test() {
     cwd: process.cwd(),
   });
 
+  try { execSync("pkill -f ClaudeNotify.app/Contents/MacOS/notify 2>/dev/null", { stdio: "pipe" }); } catch {}
+
   const child = spawn(path.join(MACOS_DIR, "notify"), ["Claude Code"], {
     stdio: ["pipe", "inherit", "inherit"],
   });
   child.stdin.write(testPayload);
   child.stdin.end();
   child.unref();
-  console.log("  Sent test notification");
+
+  log();
+  done("Sent test notification");
+  info("Check your notification center");
+  log();
 }
 
 // ── CLI ─────────────────────────────────────────────────────────────────
@@ -265,9 +405,15 @@ switch (command) {
     test();
     break;
   default:
-    console.log("\n  claude-notification — Native macOS notifications for Claude Code\n");
-    console.log("  Usage:");
-    console.log("    npx claude-notification install     Set up notifications");
-    console.log("    npx claude-notification test        Send a test notification");
-    console.log("    npx claude-notification uninstall   Remove everything\n");
+    console.log(LOGO);
+    hr();
+    log();
+    log(`${c.white}Usage:${c.reset}`);
+    log();
+    log(`  ${c.orange}install${c.reset}     Set up notifications`);
+    log(`  ${c.orange}test${c.reset}        Send a test notification`);
+    log(`  ${c.orange}uninstall${c.reset}   Remove everything`);
+    log();
+    info(`npx claude-notification install`);
+    log();
 }

@@ -48,7 +48,7 @@ Removes the app, config, and Claude Code hook.
 
 ## How it works
 
-The installer creates a minimal `.app` bundle at `~/Applications/ClaudeNotify.app`. This is the only way to get a custom notification icon on modern macOS — notifications inherit the icon from the sending app bundle.
+The installer creates a minimal `.app` bundle at `~/Applications/Claude Notification.app`. This is the only way to get a custom notification icon on modern macOS — notifications inherit the icon from the sending app bundle.
 
 Claude Code's [notification hook](https://docs.anthropic.com/en/docs/claude-code/hooks) pipes JSON context (message, type, working directory) to the app via stdin. The app parses this to show contextual notifications.
 
