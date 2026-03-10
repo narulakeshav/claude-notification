@@ -1,0 +1,28 @@
+{
+  "name": "claude-notification",
+  "version": "1.0.5",
+  "description": "Native macOS notifications for Claude Code — with custom icon, click-to-focus terminal, and contextual messages",
+  "bin": {
+    "claude-notification": "bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "src/"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "notifications",
+    "macos",
+    "terminal"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/narulakeshav/claude-notification.git"
+  },
+  "author": "Keshav Narula",
+  "license": "MIT"
+}
