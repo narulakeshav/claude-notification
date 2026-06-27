@@ -144,6 +144,17 @@ final class IslandState: ObservableObject {
     @Published var contextPct: Double = 0    // 0…1 fill of the context window
     @Published var focusURL: String = ""     // warp://session/<uuid> for this tab
 
+    // ── Multi-session aggregate (≥2 sessions that have actually run) ─────────────
+    // Past one session the front pill stops narrating a single tab and shows fleet
+    // counts: a left headline (most important live signal) + grey trailing counts.
+    // Computed by the controller's rebuild() from the roster; the single-session
+    // fields above still mirror the front tab (harmless — the view ignores them while
+    // `aggregate` is true).
+    @Published var aggregate = false   // render the count pill, not the single-session one
+    @Published var runningCount = 0    // working / thinking / compacting / compacted
+    @Published var needYouCount = 0    // attention + error, merged ("go look")
+    @Published var doneCount = 0       // done within 15m (stale ones drop out)
+
     // Notch geometry, set by the controller so the island can match it.
     @Published var notchHeight: CGFloat = 32
     @Published var notchWidth: CGFloat = 200
@@ -442,6 +453,12 @@ struct IslandView: View {
         .onAppear { AppController.shared?.updateGeom(pillWidth: pillWidth, islandOffset: islandOffset) }
     }
 
+    // A row is "inactive" when its dot is grey — idle tabs and stale (long-finished)
+    // sessions, plus any unrecognized status. Mirror this in dotColor's grey cases.
+    private func isInactiveStatus(_ status: String) -> Bool {
+        !["thinking", "working", "attention", "error", "done", "compacting", "compacted"].contains(status)
+    }
+
     // Status-dot color for a background session.
     private func dotColor(_ status: String) -> Color {
         switch status {
@@ -652,23 +669,25 @@ struct IslandView: View {
         // persistent tint, lighter than the hover highlight. Hovering bumps to full alpha.
         let rowBG: Color = hl ? Color.white.opacity(0.13)
             : (card.isSelected ? Color.white.opacity(0.10) : Color.clear)
+        // Inactive rows (grey dot — idle / stale) get a grey title too, so the whole row
+        // recedes and the active sessions read first.
+        let titleColor: Color = isInactiveStatus(card.status)
+            ? Color(white: 0.5)
+            : (card.isSelected ? .white : Color(white: 0.9))
         return HStack(spacing: 10) {
             rowMarker(card.status)
             Group {
                 // A just-compacted session flags itself with a blue "Compacted" prefix, and
-                // a session waiting on the user with an amber "Input Needed" one, so the state
+                // a session waiting on the user with an orange "Input Needed" one, so the state
                 // is legible in the list ahead of the tab's own title.
                 if card.status == "compacted" {
                     Text("Compacted ").foregroundColor(IslandView.compact)
-                        + Text(card.title.isEmpty ? card.project : card.title)
-                            .foregroundColor(card.isSelected ? .white : Color(white: 0.9))
+                        + Text(card.title.isEmpty ? card.project : card.title).foregroundColor(titleColor)
                 } else if card.status == "attention" {
                     Text("Input Needed ").foregroundColor(IslandView.orange)
-                        + Text(card.title.isEmpty ? card.project : card.title)
-                            .foregroundColor(card.isSelected ? .white : Color(white: 0.9))
+                        + Text(card.title.isEmpty ? card.project : card.title).foregroundColor(titleColor)
                 } else {
-                    Text(card.title.isEmpty ? card.project : card.title)
-                        .foregroundColor(card.isSelected ? .white : Color(white: 0.9))
+                    Text(card.title.isEmpty ? card.project : card.title).foregroundColor(titleColor)
                 }
             }
             .font(.custom(kSansFontName, size: 13))
@@ -733,8 +752,37 @@ struct IslandView: View {
 
     // Width reserved for the leading icon (gif / image / glyph) + spacing.
     private var leadingSlot: CGFloat {
-        let iconW: CGFloat = state.mode == .attention ? 14 : (state.mode == .error ? 16 : 18)
+        let iconW: CGFloat
+        if state.aggregate {
+            iconW = aggKind == .needYou ? 14 : 18   // "!" is 14; gif / "✓" are 18
+        } else {
+            iconW = state.mode == .attention ? 14 : (state.mode == .error ? 16 : 18)
+        }
         return iconW + (primary.isEmpty ? 0 : 8)
+    }
+
+    // ── Fleet aggregate (≥2 sessions) ───────────────────────────────────────────
+    // The left headline is the single most important live signal; need-you always
+    // wins it (red), then running, then done. Whatever isn't the headline trails on
+    // the right in grey — need-you never appears there.
+    private enum AggKind { case needYou, running, done }
+    private var aggKind: AggKind {
+        if state.needYouCount > 0 { return .needYou }
+        if state.runningCount > 0 { return .running }
+        return .done
+    }
+    private var aggHeadline: String {
+        switch aggKind {
+        case .needYou: return "\(state.needYouCount) need you"
+        case .running: return "\(state.runningCount) running…"
+        case .done:    return "\(state.doneCount) done"
+        }
+    }
+    private var aggRight: String {
+        var parts: [String] = []
+        if aggKind != .running, state.runningCount > 0 { parts.append("\(state.runningCount) running") }
+        if aggKind != .done,    state.doneCount    > 0 { parts.append("\(state.doneCount) done") }
+        return parts.joined(separator: " · ")
     }
     private var leftW: CGFloat {
         leadingSlot + textWidth(primary, IslandView.serifFont, tracking: 0.5)
@@ -749,6 +797,13 @@ struct IslandView: View {
 
     // Verb/label color matches the state.
     private var primaryColor: Color {
+        if state.aggregate {
+            switch aggKind {
+            case .needYou: return IslandView.red
+            case .running: return IslandView.coral
+            case .done:    return IslandView.green
+            }
+        }
         switch state.mode {
         case .thinking: return IslandView.amber
         case .done:     return IslandView.green
@@ -769,6 +824,7 @@ struct IslandView: View {
     // Right side: live timer while thinking; a clip of Claude's message/action
     // while working, on done, and for permission prompts.
     private var rightText: String {
+        if state.aggregate { return aggRight }
         switch state.mode {
         case .thinking:                  return state.elapsed
         // When a working event has no verb, the preview is promoted to the left as the
@@ -860,6 +916,7 @@ struct IslandView: View {
     private var frontPeekH: CGFloat { (state.frontHovered && !state.dropdownOpen) ? kFrontPeek : 0 }
 
     private var primary: String {
+        if state.aggregate { return aggHeadline }
         switch state.mode {
         case .error: return "Error"
         case .compacting: return "Compacting…"
@@ -882,6 +939,21 @@ struct IslandView: View {
     }
 
     @ViewBuilder private var leading: some View {
+        if state.aggregate {
+            switch aggKind {
+            case .needYou:
+                Image(systemName: "exclamationmark").font(.system(size: 13, weight: .bold)).foregroundColor(IslandView.red).frame(width: 14)
+            case .running:
+                icon(kGifPath, fallback: AnyView(Spinner(accent: IslandView.coral, mode: .working)))
+            case .done:
+                Image(systemName: "checkmark").font(.system(size: 12, weight: .bold)).foregroundColor(IslandView.green).frame(width: 18)
+            }
+        } else {
+            leadingSingle
+        }
+    }
+
+    @ViewBuilder private var leadingSingle: some View {
         switch state.mode {
         case .thinking:
             icon(kThinkingGifPath, fallback: AnyView(Spinner(accent: accent, mode: .working)))
@@ -1594,6 +1666,26 @@ final class AppController: NSObject, NSApplicationDelegate {
         let anyActive = vis.values.contains { $0.mode == "working" || $0.mode == "thinking" }
         if anyActive { startClock() } else { stopClock() }
 
+        // Fleet reducer: tally the roster into the three buckets the front pill and (later)
+        // the dropdown headers both read. The roster's `status` already bakes in the 15-min
+        // done→stale rule, so `done` here is "finished within 15 min"; stale/idle count
+        // toward nothing. Aggregate kicks in once ≥2 sessions have actually run.
+        let running = state.roster.filter { ["working", "thinking", "compacting", "compacted"].contains($0.status) }.count
+        let needYou = state.roster.filter { ["attention", "error"].contains($0.status) }.count
+        let done = state.roster.filter { $0.status == "done" }.count
+        state.runningCount = running
+        state.needYouCount = needYou
+        state.doneCount = done
+        state.aggregate = (running + needYou + done) >= 2
+
+        // Nothing live and nothing waiting on you (all stale / idle) → hide the island
+        // entirely, unless the dropdown is open showing the earlier sessions.
+        if running + needYou + done == 0 && !state.dropdownOpen {
+            Ticker.shared.stop()
+            panel.orderOut(nil)
+            return
+        }
+
         position()
         panel.orderFrontRegardless()
     }
@@ -1717,7 +1809,8 @@ final class AppController: NSObject, NSApplicationDelegate {
                 case "thinking": thinking = true; verb = "Thinking"
                 case "tool_use":
                     verb = verbForTool(last["name"] as? String ?? "")
-                    action = toolTarget(last["name"] as? String ?? "", last["input"] as? [String: Any] ?? [:])
+                    let tgt = toolTarget(last["name"] as? String ?? "", last["input"] as? [String: Any] ?? [:])
+                    action = (verb + " " + tgt).trimmingCharacters(in: .whitespaces)   // "Reading island.swift"
                 case "text":     verb = "Responding"
                 default:         break
                 }
@@ -1768,11 +1861,12 @@ final class AppController: NSObject, NSApplicationDelegate {
                                      || s.mode == "attention" || s.mode == "error")
                     if !protected, let st = statuses[sessionId] {
                         if st == "busy" {
-                            // Actively computing: pick thinking vs working from the transcript.
-                            let newMode = (acts[uuid]?.thinking ?? false) ? "thinking" : "working"
-                            if s.mode != "working" && s.mode != "thinking" { s.turnStartTs = now }
-                            if s.mode != newMode { s.mode = newMode; changed = true }
-                            if let v = acts[uuid]?.verb, !v.isEmpty, s.detail != v { s.detail = v; changed = true }
+                            // Actively computing. Only un-stick a stale terminal state (resumed
+                            // turn) — leave thinking/working and the verb to the hooks, which own
+                            // the playful gerund vocabulary.
+                            if s.mode != "working" && s.mode != "thinking" {
+                                s.mode = "working"; s.turnStartTs = now; changed = true
+                            }
                         } else if s.mode == "working" || s.mode == "thinking" {
                             // CC went idle but we're still showing active → the turn ended and
                             // we haven't seen the Stop hook yet. Settle to "done" immediately.

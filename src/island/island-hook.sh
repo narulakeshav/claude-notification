@@ -173,12 +173,10 @@ case "$EVENT" in
         emit thinking "Thinking…" ""
         ;;
     tool)
-        # Left = the real verb for what's running (Reading/Editing/…); right = the concrete
-        # object (file / command / pattern), or Claude's latest text if its last block is text.
-        # The daemon's live poll keeps this fresh between events, but emitting the real verb
-        # here (not a random gerund) means there's no cosmetic flash before the poll catches up.
-        # python prints "VERB<TAB>PREVIEW".
-        OUT=$(echo "$INPUT" | python3 -c "
+        # Left = a playful gerund (Claude Code's own spinner vocabulary — the real word isn't
+        # exposed to hooks, so we pick our own). Right = the concrete action: Claude's text if
+        # its latest block is text, else "<verb> <target>" (file / command / pattern).
+        PREVIEW=$(echo "$INPUT" | python3 -c "
 import sys, json, os
 d = json.load(sys.stdin)
 tx = d.get('transcript_path','')
@@ -197,7 +195,7 @@ try:
             break
 except: pass
 if last_kind=='text' and last_text.strip():
-    print('Responding\t'+last_text.strip().split(chr(10))[0][:60])
+    print(last_text.strip().split(chr(10))[0][:60])
 else:
     tool=d.get('tool_name',''); ti=d.get('tool_input',{}) or {}
     base=lambda p: os.path.basename(p) if p else ''
@@ -210,12 +208,9 @@ else:
     label={'Edit':'Editing','MultiEdit':'Editing','Write':'Writing','Read':'Reading',
            'NotebookEdit':'Editing','Bash':'Running','Grep':'Searching','Glob':'Finding',
            'Task':'Delegating','WebFetch':'Fetching','WebSearch':'Searching','TodoWrite':'Planning'}.get(tool,tool)
-    print((label or 'Working')+'\t'+tgt)
+    print((label+' '+tgt).strip())
 " 2>/dev/null)
-        VERB=""; PREVIEW=""
-        IFS=$'\t' read -r VERB PREVIEW <<< "$OUT"
-        [ -z "$VERB" ] && VERB="Working"
-        emit working "$VERB" "$PREVIEW"
+        emit working "$(pick)…" "$PREVIEW"
         ;;
     post)
         # A tool just finished. If it errored, flash an error state with the
