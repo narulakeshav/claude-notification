@@ -17,6 +17,7 @@ import CoreText
 let kEventDir = NSString("~/.claude-island").expandingTildeInPath
 let kEventFile = kEventDir + "/event.json"
 let kSessionsDir = kEventDir + "/sessions"     // one <tabUUID>.json per live session
+let kProjectOrderFile = kEventDir + "/project-order"   // persisted dropdown group order (first-seen)
 let kGifPath = kEventDir + "/claude.gif"               // working
 let kThinkingGifPath = kEventDir + "/claude-thinking.gif"  // thinking
 let kDoneImagePath = kEventDir + "/claude-done.tiff"       // success
@@ -76,6 +77,7 @@ let kCardTuck: CGFloat = 56       // how far a hovered card's right edge tucks u
 let kCardTextPad: CGFloat = 22    // title leading inset (clears the concave shoulder)
 let kCardTextGap: CGFloat = 8     // gap after the title before the tuck
 let kCardSansFont = NSFont(name: kSansFontName, size: 13) ?? .systemFont(ofSize: 13)
+let kTimerFont = NSFont(name: kSansFontName, size: 12) ?? .systemFont(ofSize: 12)  // dropdown row timer
 
 // Dropdown ("{n} ⌄") UI geometry, shared by the view and the controller's hit-testing.
 let kAgentsPeek: CGFloat = 32     // how far the "{n} ⌄" back pill peeks past the pill's right edge
@@ -83,7 +85,7 @@ let kSheetSide: CGFloat = 40      // how much wider (each side) the expanded she
 let kRowHeight: CGFloat = 32      // dropdown row height
 let kHeaderHeight: CGFloat = 22   // dropdown section-header (project label) height
 let kDropdownVPad: CGFloat = 6    // vertical padding below the pill row, inside the sheet
-let kDropdownBottomPad: CGFloat = 8   // padding below the last row, inside the rounded bottom
+let kDropdownBottomPad: CGFloat = 6   // padding below the last row, inside the rounded bottom
 let kRowInset: CGFloat = 14       // row horizontal inset from the sheet edge
 
 /// One entry in the dropdown: either a project section header or a session row. Headers
@@ -98,6 +100,12 @@ struct DropdownItem: Identifiable {
 /// Total pixel height of the dropdown's item stack (headers are shorter than rows).
 func dropdownContentHeight(_ items: [DropdownItem]) -> CGFloat {
     items.reduce(0) { $0 + ($1.isHeader ? kHeaderHeight : kRowHeight) }
+}
+
+/// Whether a row draws a context ring (shared by the view and the controller's hit-test):
+/// only once the window is ≥25% full, and never on the grey idle/stale rows.
+func ringVisible(_ card: SessionCard) -> Bool {
+    card.context >= 0.25 && card.status != "idle" && card.status != "stale"
 }
 
 /// Truncated card label (title or, if empty, project), matching what the view draws.
@@ -155,6 +163,7 @@ final class IslandState: ObservableObject {
     @Published var dropdownItems: [DropdownItem] = []   // roster grouped by project (+ headers)
     @Published var dropdownOpen = false
     @Published var hoveredRow: String? = nil    // dropdown row under the cursor
+    @Published var hoveredRing: String? = nil   // dropdown row whose context ring is hovered
 
     static let shared = IslandState()
 }
@@ -166,8 +175,10 @@ struct SessionCard: Identifiable {
     var title: String = ""  // ai-title, shown on hover
     var status: String = "" // mode string, drives the dot/bg color
     var focus: String = ""  // warp://session/<uuid>
-    var isFront: Bool = false  // is this the current front-pill session (in the roster)
+    var isSelected: Bool = false  // highlighted row: the Warp-active tab, else the front session
     var elapsed: String = "" // turn timer text; live while active, frozen when done
+    var context: Double = 0  // 0…1 context-window fill, for the per-row ring
+    var preview: String = "" // latest action / message, shown grey after the title
 }
 
 struct EventPayload: Decodable {
@@ -413,7 +424,7 @@ struct IslandView: View {
         case "working":           return IslandView.coral
         case "attention", "error": return IslandView.red
         case "done":              return IslandView.green
-        case "stale":             return Color(white: 0.5)   // done, unattended >5 min
+        case "stale":             return Color(white: 0.5)   // done, unattended >15 min
         default:                  return Color(white: 0.55)
         }
     }
@@ -606,17 +617,51 @@ struct IslandView: View {
 
     private func dropdownRow(_ card: SessionCard) -> some View {
         let hl = state.hoveredRow == card.id
-        // The current front session reads as "selected": a soft persistent tint, lighter
-        // than the hover highlight. Hovering it still bumps up to the full hover alpha.
+        // The selected session (Warp-active tab, else front) reads as "selected": a soft
+        // persistent tint, lighter than the hover highlight. Hovering bumps to full alpha.
         let rowBG: Color = hl ? Color.white.opacity(0.13)
-            : (card.isFront ? Color.white.opacity(0.10) : Color.clear)
+            : (card.isSelected ? Color.white.opacity(0.10) : Color.clear)
         return HStack(spacing: 10) {
             rowMarker(card.status)
             Text(card.title.isEmpty ? card.project : card.title)
                 .font(.custom(kSansFontName, size: 13))
-                .foregroundColor(card.isFront ? .white : Color(white: 0.9))
+                .foregroundColor(card.isSelected ? .white : Color(white: 0.9))
                 .lineLimit(1)
-            Spacer(minLength: 8)
+                .layoutPriority(1)            // title keeps its width; preview yields first
+            // Latest action / message in grey, filling the gap and truncating with an
+            // ellipsis. Its expanding frame also right-pins the ring + timer.
+            if !card.preview.isEmpty {
+                Text(card.preview)
+                    .font(.custom(kSansFontName, size: 12))
+                    .foregroundColor(Color(white: 0.45))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                Spacer(minLength: 8)
+            }
+            // Per-session context-window fill, mirroring the front pill's ring — only for
+            // active/done rows, not the grey ones (idle / stale). Sits LEFT of the timer.
+            // Hovering it floats a small label above (SwiftUI hover can't fire in this panel,
+            // so the controller's mouse hit-test drives `hoveredRing`).
+            if ringVisible(card) {
+                ContextRing(pct: card.context)
+                    .overlay(alignment: .top) {
+                        if state.hoveredRing == card.id {
+                            Text("\(Int((card.context * 100).rounded()))% context used")
+                                .font(.custom(kSansFontName, size: 11))
+                                .foregroundColor(.white)
+                                .fixedSize()
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 5)
+                                .background(Capsule(style: .continuous).fill(Color.black.opacity(0.92)))
+                                .overlay(Capsule(style: .continuous).stroke(Color.white.opacity(0.1), lineWidth: 1))
+                                .offset(y: -20)
+                                .zIndex(100)
+                                .allowsHitTesting(false)
+                        }
+                    }
+            }
             if !card.elapsed.isEmpty {
                 Text(card.elapsed)
                     .font(.custom(kSansFontName, size: 12))
@@ -648,15 +693,10 @@ struct IslandView: View {
     private var leftW: CGFloat {
         leadingSlot + textWidth(primary, IslandView.serifFont, tracking: 0.5)
     }
-    // Whether the context ring is drawn (matches the `island` body condition).
-    private var ringShown: Bool { state.contextPct > 0 }
-    // Right cluster: leading pad (3) + message text + gap (7, only if both) + ring (12).
+    // Right cluster: leading pad (3) + message text. The context ring now lives per-row in
+    // the dropdown, so the front pill no longer draws it (would be redundant).
     private var rightW: CGFloat {
-        let rt = rightText
-        let textPart = textWidth(rt, IslandView.sansFont)
-        let ring: CGFloat = ringShown ? 12 : 0
-        let gap: CGFloat = (!rt.isEmpty && ringShown) ? 7 : 0
-        return 3 + textPart + gap + ring
+        3 + textWidth(rightText, IslandView.sansFont)
     }
 
     private static let green = Color(red: 0.45, green: 0.82, blue: 0.52)
@@ -716,7 +756,7 @@ struct IslandView: View {
             // Centered notch gap (+ clearance so text never touches the camera).
             Color.clear.frame(width: state.notchWidth + notchClearance)
 
-            // Right: message/timer + context ring.
+            // Right: message/timer (context ring moved to the dropdown rows).
             HStack(spacing: 7) {
                 if !rightText.isEmpty {
                     Text(rightText)
@@ -726,9 +766,6 @@ struct IslandView: View {
                         .foregroundColor(Color(white: 0.62))
                         .lineLimit(1)
                         .fixedSize()
-                }
-                if ringShown {
-                    ContextRing(pct: state.contextPct)
                 }
             }
             .padding(.leading, 3)
@@ -813,17 +850,23 @@ struct Spinner: View {
     }
 }
 
-/// Context-window fill gauge. Grey track (matching the preview text), white arc
-/// for the filled portion, swept clockwise from 12 o'clock.
+/// Context-window fill gauge. Grey track (matching the preview text), with the filled
+/// arc swept clockwise from 12 o'clock — white when low, amber past a third, red past half.
 struct ContextRing: View {
     let pct: Double
+    // Warn as the window fills: white < 30%, amber 30–50%, red > 50%.
+    private var fillColor: Color {
+        if pct > 0.5  { return Color(red: 0.898, green: 0.282, blue: 0.302) }  // red
+        if pct > 0.30 { return Color(red: 1.0, green: 0.745, blue: 0.0) }      // amber
+        return .white
+    }
     var body: some View {
         ZStack {
             Circle()
                 .stroke(Color(white: 0.62).opacity(0.55), lineWidth: 2)
             Circle()
                 .trim(from: 0, to: max(0.02, min(1, pct)))
-                .stroke(Color.white, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                .stroke(fillColor, style: StrokeStyle(lineWidth: 2, lineCap: .round))
                 .rotationEffect(.degrees(-90))
         }
         .frame(width: 12, height: 12)
@@ -897,9 +940,15 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var lastSeenLive: [String: Double] = [:]   // uuid → last scan that saw it (debounce)
     private var liveTabCwd: [String: String] = [:]     // uuid → cwd, for idle (no-file) tab labels
     private var liveTabTitle: [String: String] = [:]   // uuid → last-known label, kept after a file is gone
+    private var liveTabContext: [String: Double] = [:]  // uuid → last-known context fill, for idle rings
+    private var projectOrder: [String] = []             // dropdown group order, by first-seen (never reshuffled)
+    private var activeWarpTab: String?                  // uuid of the tab focused in Warp (drives row highlight)
+    private var lastDbActiveTab: String?                // last active tab Warp's DB reported (to detect real switches)
     private var clickFocus: String?             // a tab the user clicked → pin to front
     private var clickFocusTs: Double = 0        // newest activity ts at click time; the pin
                                                 // releases once any tab posts something newer
+    private var dropdownFrozenOrder: [String]?  // row id order locked while the menu is open,
+                                                // so rows don't reshuffle under the cursor
     private var frontUUID: String?              // current front-pill session
 
     // Live pill geometry, reported by the view (which computes it deterministically).
@@ -917,6 +966,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         if let m = try? String(contentsOfFile: kEventDir + "/ui-mode", encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines), !m.isEmpty {
             IslandState.shared.uiMode = m
+        }
+
+        // Persisted dropdown group order (first-seen project names, one per line) so the
+        // dir headers keep their "when first opened" order across daemon restarts.
+        if let raw = try? String(contentsOfFile: kProjectOrderFile, encoding: .utf8) {
+            projectOrder = raw.split(separator: "\n").map(String.init)
         }
 
         let hosting = ClickableHostingView(rootView: IslandView())
@@ -1077,6 +1132,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         let items = s.dropdownItems
         guard s.dropdownOpen, !items.isEmpty else {
             if s.hoveredRow != nil { s.hoveredRow = nil }
+            if s.hoveredRing != nil { s.hoveredRing = nil }
             return
         }
         let islandH = max(s.notchHeight, 30)
@@ -1084,9 +1140,11 @@ final class AppController: NSObject, NSApplicationDelegate {
         // kSheetSide to the right. Screen coords have origin bottom-left, so items go DOWN.
         let leftEdge = f.midX + curIslandOffset - curPillWidth / 2
         let rightEdge = leftEdge + curPillWidth + kSheetSide
+        let listRight = rightEdge - kRowInset       // rows are inset kRowInset inside the sheet
         let contentTop = f.maxY - islandH - kDropdownVPad
         guard p.x >= leftEdge, p.x <= rightEdge, p.y <= contentTop, p.y >= contentTop - dropdownContentHeight(items) else {
             if s.hoveredRow != nil { setRow(nil) }
+            if s.hoveredRing != nil { s.hoveredRing = nil }
             return
         }
         var y = contentTop
@@ -1095,11 +1153,22 @@ final class AppController: NSObject, NSApplicationDelegate {
             if p.y <= y, p.y > y - h {
                 let id = item.card?.id            // nil over a header → clears hover
                 if s.hoveredRow != id { setRow(id) }
+                // The ring sits LEFT of the (variable-width) timer: trailing pad (12), then
+                // the timer, then a 10px gap, then the 12px ring. Locate that band.
+                let overRing: Bool = item.card.map { card in
+                    guard ringVisible(card) else { return false }
+                    let timerW = card.elapsed.isEmpty ? 0 : textWidth(card.elapsed, kTimerFont)
+                    let ringRight = listRight - 12 - (timerW > 0 ? timerW + 10 : 0)
+                    return p.x >= ringRight - 12 - 6 && p.x <= ringRight + 6
+                } ?? false
+                let ringID = overRing ? id : nil
+                if s.hoveredRing != ringID { s.hoveredRing = ringID }
                 return
             }
             y -= h
         }
         if s.hoveredRow != nil { setRow(nil) }
+        if s.hoveredRing != nil { s.hoveredRing = nil }
     }
 
     private func setRow(_ id: String?) {
@@ -1118,15 +1187,29 @@ final class AppController: NSObject, NSApplicationDelegate {
         let active = sessions
             .filter { $0.value.mode == "thinking" || $0.value.mode == "working" }
             .map { ($0.key, $0.value.transcript) }
+        // Every session's transcript, so a /rename (which fires no hook) is picked up here
+        // within a scan cycle instead of waiting for that tab's next activity.
+        let titleScan = sessions.compactMap { $0.value.transcript.isEmpty ? nil : ($0.key, $0.value.transcript) }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             let live = self.computeLiveTabs()
+            let warpTab = self.warpActiveTab()
             var interrupted = Set<String>()
             for (uuid, tx) in active where !tx.isEmpty {
                 if self.transcriptInterrupted(tx) { interrupted.insert(uuid) }
             }
+            var titles: [String: String] = [:]
+            for (uuid, tx) in titleScan {
+                if let t = self.transcriptTitle(tx), !t.isEmpty { titles[uuid] = t }
+            }
             DispatchQueue.main.async {
                 let now = Date().timeIntervalSince1970
+                self.applyDBActiveTab(warpTab)
+                // Apply any renamed titles (manual /rename wins over the auto ai-title).
+                for (u, t) in titles where self.sessions[u]?.aiTitle != t {
+                    self.sessions[u]?.aiTitle = t
+                    self.liveTabTitle[u] = t
+                }
                 for (u, c) in live {
                     self.lastSeenLive[u] = now
                     if !c.isEmpty { self.liveTabCwd[u] = c }
@@ -1173,12 +1256,18 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     /// Open/close the dropdown menu and resize the panel to fit it.
     func toggleDropdown() {
-        IslandState.shared.dropdownOpen.toggle()
+        let s = IslandState.shared
+        s.dropdownOpen.toggle()
+        if s.dropdownOpen { refreshActiveTab() }   // freshest active-tab highlight on open
+        // Lock the current row order on open so timers/activity can't reshuffle rows under
+        // the cursor; release it on close so the list re-sorts by recency again.
+        dropdownFrozenOrder = s.dropdownOpen ? s.roster.map { $0.id } : nil
         position()
     }
     func closeDropdown() {
         guard IslandState.shared.dropdownOpen else { return }
         IslandState.shared.dropdownOpen = false
+        dropdownFrozenOrder = nil
         position()
     }
 
@@ -1214,7 +1303,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         // after its file is deleted/interrupted — shows the title, not just the dir.
         let label = s.aiTitle.isEmpty ? s.project : s.aiTitle
         if !label.isEmpty { liveTabTitle[id] = label }
-        if let v = sf.context { s.context = v }
+        if let v = sf.context { s.context = v; if v > 0 { liveTabContext[id] = v } }
         if let v = sf.focus { s.focus = v }
         if let v = sf.cwd { s.cwd = v }
         if let v = sf.transcript { s.transcript = v }
@@ -1275,17 +1364,21 @@ final class AppController: NSObject, NSApplicationDelegate {
         // Back cards: the other live sessions, most-recent first. The uuid breaks ties
         // deterministically so equal-timestamp cards keep a STABLE order — otherwise the
         // dictionary's random iteration order reshuffles them every rebuild (the
-        // "carousel" rotation). A done card stays green for 5 min, then greys (stale).
+        // "carousel" rotation). A done card stays green for 15 min, then greys (stale).
         let now = Date().timeIntervalSince1970
+        // Highlighted dropdown row = the tab currently focused in Warp (from Warp's DB),
+        // falling back to the front session when unknown. Highlight only — never re-fronts.
+        let selected = (activeWarpTab.flatMap { liveTabs.contains($0) ? $0 : nil }) ?? front
         func makeCard(_ k: String, _ v: LiveSession) -> SessionCard {
-            let status = (v.mode == "done" && now - v.ts > 300) ? "stale" : v.mode
+            let status = (v.mode == "done" && now - v.ts > 900) ? "stale" : v.mode
             // Show a turn timer for active (working/thinking) and finished (done/stale)
             // sessions; formatElapsed ticks live for active and freezes at ts for done.
             let showTimer = ["working", "thinking", "done"].contains(v.mode) || status == "stale"
             return SessionCard(id: k, project: v.project,
                                title: v.aiTitle.isEmpty ? v.project : v.aiTitle,
-                               status: status, focus: v.focus, isFront: k == front,
-                               elapsed: showTimer ? formatElapsed(v) : "")
+                               status: status, focus: v.focus, isSelected: k == selected,
+                               elapsed: showTimer ? formatElapsed(v) : "",
+                               context: v.context, preview: v.preview)
         }
         // Idle live tabs: a Warp tab running claude that hasn't written a state file
         // (never emitted, or its file was cleared). Surface a neutral entry so the deck
@@ -1300,15 +1393,36 @@ final class AppController: NSObject, NSApplicationDelegate {
             s.project = cwd.isEmpty ? "Claude Code" : (cwd as NSString).lastPathComponent
             // Prefer the tab's last-known session title over its directory name.
             s.aiTitle = liveTabTitle[u] ?? ""
+            s.context = liveTabContext[u] ?? 0   // last-known fill, so the ring persists
             idle[u] = s
         }
         let all = vis.merging(idle) { a, _ in a }
 
-        let ordered = all.sorted { ($0.value.ts, $0.key) > ($1.value.ts, $1.key) }
+        var ordered = all.sorted { ($0.value.ts, $0.key) > ($1.value.ts, $1.key) }
+        // While the dropdown is open, hold the row order it had on open (new sessions append
+        // by recency) so ticking timers / new activity never slide a row under the cursor.
+        if state.dropdownOpen, let frozen = dropdownFrozenOrder {
+            let rank = Dictionary(frozen.enumerated().map { ($1, $0) }, uniquingKeysWith: { a, _ in a })
+            ordered.sort { a, b in
+                let ra = rank[a.key] ?? Int.max, rb = rank[b.key] ?? Int.max
+                return ra != rb ? ra < rb : (a.value.ts, a.key) > (b.value.ts, b.key)
+            }
+        }
         state.cards = ordered.filter { $0.key != front }.prefix(5).map { makeCard($0.key, $0.value) }
         // dropdown roster: every live tab (front + others + idle), most-recent first.
         state.roster = ordered.map { makeCard($0.key, $0.value) }
-        state.dropdownItems = Self.groupRoster(state.roster)
+
+        // Dropdown group order = the order projects were FIRST SEEN by the daemon, persisted
+        // to disk so it reflects when each tab was first opened and survives restarts. A new
+        // project is appended (oldest stays on top, new tabs land at the bottom) and never
+        // reshuffles afterward. A batch first seen together is tie-broken by ascending ts.
+        let projFirstTs = Dictionary(grouping: all.values, by: { $0.project.isEmpty ? "Claude Code" : $0.project })
+            .mapValues { $0.map(\.ts).min() ?? 0 }
+        var orderGrew = false
+        for proj in projFirstTs.keys.sorted(by: { (projFirstTs[$0]!, $0) < (projFirstTs[$1]!, $1) })
+        where !projectOrder.contains(proj) { projectOrder.append(proj); orderGrew = true }
+        if orderGrew { try? projectOrder.joined(separator: "\n").write(toFile: kProjectOrderFile, atomically: true, encoding: .utf8) }
+        state.dropdownItems = Self.groupRoster(state.roster, order: projectOrder)
 
         // Spinner follows the front session.
         switch state.mode {
@@ -1375,6 +1489,31 @@ final class AppController: NSObject, NSApplicationDelegate {
         return false
     }
 
+    /// Latest session title from the transcript: a manual /rename (`custom-title`) wins over
+    /// Claude's auto `ai-title`. Reads a tail (a just-made rename is near the end) so the
+    /// periodic scan stays cheap. File IO, safe off the main thread.
+    private func transcriptTitle(_ path: String) -> String? {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? fh.close() }
+        let size = fh.seekToEndOfFile()
+        let span: UInt64 = 262_144
+        fh.seek(toFileOffset: size > span ? size - span : 0)
+        guard let data = try? fh.readToEnd(), let s = String(data: data, encoding: .utf8) else { return nil }
+        var ai: String? = nil
+        for line in s.split(separator: "\n").reversed() {
+            guard let d = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { continue }
+            switch obj["type"] as? String {
+            case "custom-title":
+                if let c = obj["customTitle"] as? String, !c.isEmpty { return c }  // rename wins outright
+            case "ai-title":
+                if ai == nil, let a = obj["aiTitle"] as? String, !a.isEmpty { ai = a }
+            default: break
+            }
+        }
+        return ai
+    }
+
     private func uuidIn(_ s: String) -> String? {
         guard let r = s.range(of: "WARP_TERMINAL_SESSION_UUID=") else { return nil }
         let u = s[r.upperBound...].prefix { $0.isHexDigit }
@@ -1388,6 +1527,64 @@ final class AppController: NSObject, NSApplicationDelegate {
         let d = out.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         return String(data: d, encoding: .utf8) ?? ""
+    }
+
+    // MARK: - Warp active tab (read from Warp's own SQLite — no Accessibility prompt)
+
+    /// Path to Warp's SQLite store, in our own Group Container (readable without any TCC
+    /// grant). Channel dir varies (Warp-Stable / -Preview), so glob for dev.warp.Warp*.
+    private func warpDBPath() -> String? {
+        let base = NSString("~/Library/Group Containers/2BBY89MBSN.dev.warp/Library/Application Support")
+            .expandingTildeInPath
+        guard let dirs = try? FileManager.default.contentsOfDirectory(atPath: base) else { return nil }
+        for d in dirs where d.hasPrefix("dev.warp.Warp") {
+            let p = base + "/" + d + "/warp.sqlite"
+            if FileManager.default.fileExists(atPath: p) { return p }
+        }
+        return nil
+    }
+
+    /// UUID of the tab currently focused in Warp. Resolves app.active_window_id →
+    /// windows.active_tab_index (0-based, tabs in id order) → the tab's focused leaf →
+    /// terminal_panes.uuid. Read-only over a `mode=ro` URI so it sees Warp's live WAL
+    /// writes. Returns nil if Warp/db is absent or the row is ambiguous. Safe off-main.
+    private func warpActiveTab() -> String? {
+        guard let db = warpDBPath() else { return nil }
+        // Percent-encode the path (it has spaces) for the file: URI; keep slashes.
+        let enc = db.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? db
+        let q = """
+        WITH aw AS (SELECT active_window_id AS wid FROM app LIMIT 1),
+        atab AS (SELECT id AS tab_id FROM tabs WHERE window_id=(SELECT wid FROM aw)
+                 ORDER BY id LIMIT 1 OFFSET (SELECT active_tab_index FROM windows WHERE id=(SELECT wid FROM aw)))
+        SELECT lower(hex(tp.uuid)) FROM pane_nodes pn JOIN terminal_panes tp ON tp.id=pn.id
+        LEFT JOIN pane_leaves pl ON pl.pane_node_id=pn.id
+        WHERE pn.tab_id=(SELECT tab_id FROM atab) AND pn.is_leaf=1
+        ORDER BY (CASE WHEN pl.is_focused=1 THEN 0 ELSE 1 END), pn.id LIMIT 1;
+        """
+        let out = shell("/usr/bin/sqlite3", ["file:\(enc)?mode=ro", q])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return out.count == 32 ? out : nil
+    }
+
+    /// Apply a DB-reported active tab. Warp only updates active_tab_index on *manual* tab
+    /// switches — a deep-link focus (our row click) doesn't persist there. So we adopt the
+    /// DB value only when it actually CHANGES (a real switch); otherwise we keep whatever
+    /// activeWarpTab a click set optimistically. A nil read (Warp closed / transient) is
+    /// ignored so the highlight doesn't flicker.
+    private func applyDBActiveTab(_ dbTab: String?) {
+        guard let dbTab else { return }
+        if dbTab != lastDbActiveTab { activeWarpTab = dbTab }
+        lastDbActiveTab = dbTab
+    }
+
+    /// Re-read the Warp-active tab off-main and rebuild (called when the dropdown opens, so
+    /// the highlight is fresh even between 4s scans).
+    func refreshActiveTab() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let tab = self.warpActiveTab()
+            DispatchQueue.main.async { self.applyDBActiveTab(tab); self.rebuild() }
+        }
     }
 
     // MARK: - Clicks
@@ -1412,6 +1609,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         // Idle tabs have no state file; reconstruct the focus URL from the uuid so the
         // click still jumps to the tab. They can't be pinned (never front), so don't.
         openFocus(sessions[id]?.focus ?? "warp://session/\(id)")
+        // The click focuses this tab in Warp, but a deep-link focus doesn't update Warp's
+        // active_tab_index — so highlight it optimistically; the DB will only override this
+        // once the user manually switches tabs (applyDBActiveTab detects the change).
+        activeWarpTab = id
         if sessions[id] != nil {
             clickFocus = id
             // Remember how recent activity was when pinned; any newer event releases it.
@@ -1451,20 +1652,23 @@ final class AppController: NSObject, NSApplicationDelegate {
             c.elapsed = show ? formatElapsed(v) : ""
             return c
         }
-        s.dropdownItems = Self.groupRoster(s.roster)   // keep grouped view's timers in sync
+        s.dropdownItems = Self.groupRoster(s.roster, order: projectOrder)   // keep grouped view's timers in sync
     }
 
-    /// Group the roster by project for the dropdown. Group order follows first appearance
-    /// (roster is ts-desc, so the group with the newest session leads); rows keep ts order
-    /// within a group. Headers are emitted only when more than one project is present.
-    static func groupRoster(_ roster: [SessionCard]) -> [DropdownItem] {
-        var order: [String] = []
+    /// Group the roster by project for the dropdown. Group order follows the caller's
+    /// persistent first-seen order (oldest-opened dir on top); rows keep ts order within a
+    /// group. Headers are emitted only when more than one project is present.
+    static func groupRoster(_ roster: [SessionCard], order persistentOrder: [String]) -> [DropdownItem] {
         var groups: [String: [SessionCard]] = [:]
         for c in roster {
             let key = c.project.isEmpty ? "Claude Code" : c.project
-            if groups[key] == nil { order.append(key) }
             groups[key, default: []].append(c)
         }
+        // Group (dir) order follows the persistent first-seen order so headers never
+        // reshuffle when a session becomes active. Any project not yet recorded (shouldn't
+        // happen, but be safe) is appended at the end. Rows within a group keep ts order.
+        var order = persistentOrder.filter { groups[$0] != nil }
+        for key in groups.keys where !order.contains(key) { order.append(key) }
         let showHeaders = order.count > 1
         var items: [DropdownItem] = []
         for key in order {

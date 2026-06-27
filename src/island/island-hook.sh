@@ -37,19 +37,23 @@ CWD=$(echo "$INPUT" | python3 -c "import sys,json,os;d=json.load(sys.stdin);prin
 
 TRANSCRIPT=$(echo "$INPUT" | python3 -c "import sys,json;print(json.load(sys.stdin).get('transcript_path',''))" 2>/dev/null)
 
-# Claude Code's AI-generated session title — the card's label when hovered.
+# Session title shown on the card. A manual /rename (custom-title) wins over Claude's
+# auto-generated ai-title; fall back to the latest ai-title when no custom name is set.
 AITITLE=$(python3 -c "
 import json
-t = ''
+custom = ''; ai = ''
 try:
     for line in reversed(open('$TRANSCRIPT').readlines()[-500:]):
         try: d = json.loads(line)
         except: continue
-        if d.get('type') == 'ai-title':
-            t = d.get('aiTitle', '') or ''
-            break
+        t = d.get('type')
+        if t == 'custom-title' and not custom:
+            custom = d.get('customTitle', '') or ''
+            break                      # most-recent manual rename wins outright
+        if t == 'ai-title' and not ai:
+            ai = d.get('aiTitle', '') or ''
 except: pass
-print(t)
+print(custom or ai)
 " 2>/dev/null)
 
 # Context-window fill (0..1) from the latest assistant entry's token usage.
@@ -84,11 +88,35 @@ print(round(pct, 4))
 
 # Whimsical status verbs in the spirit of Claude Code's own spinner (the real
 # word isn't exposed to hooks). A fresh one fires on each prompt/tool event.
-GERUNDS=(Baking Brewing Cogitating Computing Conjuring Cooking Crafting Crunching \
-Deliberating Divining Finagling Forging Hatching Herding Honking Ideating Imagining \
-Incubating Manifesting Marinating Moseying Mulling Musing Noodling Percolating Pondering \
-Processing Puzzling Reticulating Ruminating Schlepping Shimmying Simmering Spelunking \
-Sprouting Stewing Synthesizing Tinkering Transmuting Unfurling Vibing Wandering Whirring)
+GERUNDS=(
+"Accomplishing" "Actioning" "Actualizing" "Architecting" "Baking" "Beaming" "Beboppin'" \
+"Befuddling" "Billowing" "Blanching" "Bloviating" "Boogieing" "Boondoggling" "Booping" \
+"Bootstrapping" "Brewing" "Bunning" "Burrowing" "Calculating" "Canoodling" "Caramelizing" \
+"Cascading" "Catapulting" "Cerebrating" "Channeling" "Channelling" "Choreographing" "Churning" \
+"Clauding" "Coalescing" "Cogitating" "Combobulating" "Composing" "Computing" "Concocting" \
+"Considering" "Contemplating" "Cooking" "Crafting" "Creating" "Crunching" "Crystallizing" \
+"Cultivating" "Deciphering" "Deliberating" "Determining" "Dilly-dallying" "Discombobulating" \
+"Doing" "Doodling" "Drizzling" "Ebbing" "Effecting" "Elucidating" "Embellishing" "Enchanting" \
+"Envisioning" "Evaporating" "Fermenting" "Fiddle-faddling" "Finagling" "Flambéing" \
+"Flibbertigibbeting" "Flowing" "Flummoxing" "Fluttering" "Forging" "Forming" "Frolicking" \
+"Frosting" "Gallivanting" "Galloping" "Garnishing" "Generating" "Gesticulating" "Germinating" \
+"Gitifying" "Grooving" "Gusting" "Harmonizing" "Hashing" "Hatching" "Herding" "Honking" \
+"Hullaballooing" "Hyperspacing" "Ideating" "Imagining" "Improvising" "Incubating" "Inferring" \
+"Infusing" "Ionizing" "Jitterbugging" "Julienning" "Kneading" "Leavening" "Levitating" \
+"Lollygagging" "Manifesting" "Marinating" "Meandering" "Metamorphosing" "Misting" "Moonwalking" \
+"Moseying" "Mulling" "Mustering" "Musing" "Nebulizing" "Nesting" "Newspapering" "Noodling" \
+"Nucleating" "Orbiting" "Orchestrating" "Osmosing" "Perambulating" "Percolating" "Perusing" \
+"Philosophising" "Photosynthesizing" "Pollinating" "Pondering" "Pontificating" "Pouncing" \
+"Precipitating" "Prestidigitating" "Processing" "Proofing" "Propagating" "Puttering" "Puzzling" \
+"Quantumizing" "Razzle-dazzling" "Razzmatazzing" "Recombobulating" "Reticulating" "Roosting" \
+"Ruminating" "Sautéing" "Scampering" "Schlepping" "Scurrying" "Seasoning" "Shenaniganing" \
+"Shimmying" "Simmering" "Skedaddling" "Sketching" "Slithering" "Smooshing" "Sock-hopping" \
+"Spelunking" "Spinning" "Sprouting" "Stewing" "Sublimating" "Swirling" "Swooping" "Symbioting" \
+"Synthesizing" "Tempering" "Thinking" "Thundering" "Tinkering" "Tomfoolering" "Topsy-turvying" \
+"Transfiguring" "Transmuting" "Twisting" "Undulating" "Unfurling" "Unravelling" "Vibing" \
+"Waddling" "Wandering" "Warping" "Whatchamacalliting" "Whirlpooling" "Whirring" "Whisking" \
+"Wibbling" "Working" "Wrangling" "Zesting" "Zigzagging"
+)
 pick() { echo "${GERUNDS[$((RANDOM % ${#GERUNDS[@]}))]}"; }
 
 # First line of Claude's most recent assistant text in the transcript.
@@ -226,16 +254,18 @@ except: print('')
     attention)
         NT=$(echo "$INPUT" | python3 -c "import sys,json;print(json.load(sys.stdin).get('notification_type','') or '')" 2>/dev/null)
         if [ "$NT" = "idle_prompt" ]; then
-            # A finished (done) session that's merely sitting idle should stay green
-            # "Finished" — not flip to a red attention state just because Claude Code
-            # nudges "Waiting for input" ~60s later. Suppress the nudge when already done.
-            # (Permission prompts in the else-branch keep their red attention state.)
+            # idle_prompt is a PASSIVE nudge Claude Code fires ~60s after any idle — it does
+            # NOT mean the user is actually needed. So it must never manufacture a red
+            # "Waiting for input" state. A done session stays green "Finished"; a session
+            # still parked in working/thinking here means its turn was interrupted (Esc fires
+            # no Stop), so settle it to a calm "Finished" rather than a stuck spinner or a
+            # false attention. (Real permission/question prompts use the else-branch.)
             CURMODE=$(python3 -c "
 import json, os
 try: print(json.load(open(os.path.expanduser('~/.claude-island/$SESSION_OUT'))).get('mode',''))
 except: print('')
 " 2>/dev/null)
-            if [ "$CURMODE" != "done" ]; then emit attention "Waiting for input" ""; fi
+            if [ "$CURMODE" = "working" ] || [ "$CURMODE" = "thinking" ]; then emit done "" ""; fi
         else
             # Permission: keep the pending tool action (set by the preceding
             # PreToolUse) on the right, label the left "Permission".
