@@ -112,12 +112,37 @@ GERUNDS=(
 "Ruminating" "Sautéing" "Scampering" "Schlepping" "Scurrying" "Seasoning" "Shenaniganing" \
 "Shimmying" "Simmering" "Skedaddling" "Sketching" "Slithering" "Smooshing" "Sock-hopping" \
 "Spelunking" "Spinning" "Sprouting" "Stewing" "Sublimating" "Swirling" "Swooping" "Symbioting" \
-"Synthesizing" "Tempering" "Thinking" "Thundering" "Tinkering" "Tomfoolering" "Topsy-turvying" \
+"Synthesizing" "Tempering" "Thundering" "Tinkering" "Tomfoolering" "Topsy-turvying" \
 "Transfiguring" "Transmuting" "Twisting" "Undulating" "Unfurling" "Unravelling" "Vibing" \
 "Waddling" "Wandering" "Warping" "Whatchamacalliting" "Whirlpooling" "Whirring" "Whisking" \
 "Wibbling" "Working" "Wrangling" "Zesting" "Zigzagging"
 )
 pick() { echo "${GERUNDS[$((RANDOM % ${#GERUNDS[@]}))]}"; }
+
+# Count of trailing consecutive errored tool steps (a tool_result with is_error) in the
+# transcript, newest first; the first successful tool_result breaks the streak. A single tool
+# error is routine (the agent reads it and recovers), but a run of them = the agent is stuck,
+# which we surface as a "struggling" state.
+consec_tool_errors() {
+    [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ] || { echo 0; return; }
+    python3 -c "
+import json
+n = 0
+try:
+    for line in reversed(open('$TRANSCRIPT').readlines()[-400:]):
+        try: d = json.loads(line)
+        except: continue
+        if d.get('type') != 'user': continue
+        c = d.get('message', {}).get('content', '')
+        if not isinstance(c, list): continue
+        trs = [b for b in c if isinstance(b, dict) and b.get('type') == 'tool_result']
+        if not trs: continue                 # not a tool step — skip (assistant text etc.)
+        if any(b.get('is_error') for b in trs): n += 1
+        else: break                          # a clean tool result ends the streak
+except: pass
+print(n)
+" 2>/dev/null
+}
 
 # First line of Claude's most recent assistant text in the transcript.
 latest_text() {
@@ -146,15 +171,82 @@ print(last)
 " 2>/dev/null
 }
 
+# The session's opening user prompt — a stickier "which convo is this" anchor than the
+# tab name. Scans forward for the first real typed message, skipping tool results,
+# command wrappers, caveats, and system reminders. Capped to one line.
+FIRSTPROMPT=$(python3 -c "
+import json
+out = ''
+try:
+    with open('$TRANSCRIPT') as f:
+        for line in f:
+            try: d = json.loads(line)
+            except: continue
+            if d.get('type') != 'user' or d.get('isMeta'): continue
+            c = d.get('message', {}).get('content', '')
+            if isinstance(c, list):
+                msg = ' '.join(x.get('text','') for x in c
+                               if isinstance(x, dict) and x.get('type') == 'text')
+            else:
+                msg = str(c)
+            msg = ' '.join(msg.split())
+            if not msg: continue
+            if msg.startswith(('<command-', '<local-command', '<system-reminder', '<task-notification', 'Caveat:', '[Request interrupted')): continue
+            if any(b in msg for b in ('</tool-use-id>', '<tool-use-id>', '<output-file>', '<task-id>', '<task-notification')): continue
+            out = msg[:80]
+            break
+except: pass
+print(out)
+" 2>/dev/null)
+
+# The session's MOST RECENT typed user message, for the hover-peek marquee. On a
+# UserPromptSubmit the prompt is in the payload directly — prefer it: it's clean and avoids
+# the one-event lag (the transcript hasn't been written yet at that point). Otherwise scan
+# the tail, skipping system-injected pseudo-"user" messages (slash-command wrappers, caveats,
+# and especially <task-notification>/<tool-use-id>/<output-file> blocks from background tasks).
+LASTPROMPT=$(echo "$INPUT" | python3 -c "
+import sys, json
+SKIP_PREFIX = ('<command-','<local-command','<system-reminder','<task-notification','Caveat:','[Request interrupted')
+SKIP_CONTAIN = ('</tool-use-id>','<tool-use-id>','<output-file>','<task-id>','<task-notification')
+def real(m):
+    m = ' '.join((m or '').split())
+    if not m or m.startswith(SKIP_PREFIX): return ''
+    if any(b in m for b in SKIP_CONTAIN): return ''
+    return m
+d = {}
+try: d = json.load(sys.stdin)
+except: pass
+out = real(d.get('prompt',''))
+if not out:
+    try:
+        for line in reversed(open('$TRANSCRIPT').readlines()[-500:]):
+            try: e = json.loads(line)
+            except: continue
+            if e.get('type') != 'user' or e.get('isMeta'): continue
+            c = e.get('message', {}).get('content', '')
+            if isinstance(c, list):
+                m = ' '.join(x.get('text','') for x in c if isinstance(x,dict) and x.get('type')=='text')
+            else:
+                m = str(c)
+            m = real(m)
+            if m: out = m; break
+    except: pass
+print(out[:200])
+" 2>/dev/null)
+
 emit() { # emit <mode> <detail> <preview>
+    # qHeader/qText carry a pending AskUserQuestion (empty on every other emit, so a normal
+    # turn clears the previous question). emit_keep omits them, so they're retained across a
+    # follow-up Notification for the same pause.
     python3 -c "
-import json, sys
+import json, sys, os
 print(json.dumps({'mode': sys.argv[1], 'detail': sys.argv[2], 'preview': sys.argv[3],
                   'project': sys.argv[4], 'title': sys.argv[5], 'context': float(sys.argv[6]),
                   'focus': sys.argv[7], 'id': sys.argv[8], 'aiTitle': sys.argv[9],
                   'cwd': sys.argv[10], 'ts': float(sys.argv[11]), 'kind': sys.argv[12],
-                  'transcript': sys.argv[13]}))
-" "$1" "$2" "$3" "$PROJECT" "$TITLE" "$CTX" "$FOCUS" "$TAB_UUID" "$AITITLE" "$CWD" "$TS" "$EVENT" "$TRANSCRIPT" | "$SEND" "$SESSION_OUT"
+                  'transcript': sys.argv[13], 'firstPrompt': sys.argv[14], 'lastPrompt': sys.argv[15],
+                  'qHeader': os.environ.get('QHEADER',''), 'qText': os.environ.get('QTEXT','')}))
+" "$1" "$2" "$3" "$PROJECT" "$TITLE" "$CTX" "$FOCUS" "$TAB_UUID" "$AITITLE" "$CWD" "$TS" "$EVENT" "$TRANSCRIPT" "$FIRSTPROMPT" "$LASTPROMPT" | "$SEND" "$SESSION_OUT"
 }
 
 emit_keep() { # emit <mode> <detail>, omitting preview so the daemon retains it
@@ -163,8 +255,9 @@ import json, sys
 print(json.dumps({'mode': sys.argv[1], 'detail': sys.argv[2], 'project': sys.argv[3],
                   'title': sys.argv[4], 'context': float(sys.argv[5]), 'focus': sys.argv[6],
                   'id': sys.argv[7], 'aiTitle': sys.argv[8], 'cwd': sys.argv[9],
-                  'ts': float(sys.argv[10]), 'kind': sys.argv[11], 'transcript': sys.argv[12]}))
-" "$1" "$2" "$PROJECT" "$TITLE" "$CTX" "$FOCUS" "$TAB_UUID" "$AITITLE" "$CWD" "$TS" "$EVENT" "$TRANSCRIPT" | "$SEND" "$SESSION_OUT"
+                  'ts': float(sys.argv[10]), 'kind': sys.argv[11], 'transcript': sys.argv[12],
+                  'firstPrompt': sys.argv[13], 'lastPrompt': sys.argv[14]}))
+" "$1" "$2" "$PROJECT" "$TITLE" "$CTX" "$FOCUS" "$TAB_UUID" "$AITITLE" "$CWD" "$TS" "$EVENT" "$TRANSCRIPT" "$FIRSTPROMPT" "$LASTPROMPT" | "$SEND" "$SESSION_OUT"
 }
 
 case "$EVENT" in
@@ -173,6 +266,22 @@ case "$EVENT" in
         emit thinking "Thinking…" ""
         ;;
     tool)
+        # AskUserQuestion always pauses for the user, so treat it as "needs input" right here
+        # (PreToolUse) — don't wait on a Notification that may not fire. Carry the question's
+        # short header + full text so the dropdown row can show exactly what's being asked.
+        TOOL=$(echo "$INPUT" | python3 -c "import sys,json;print(json.load(sys.stdin).get('tool_name','') or '')" 2>/dev/null)
+        if [ "$TOOL" = "AskUserQuestion" ]; then
+            eval "$(echo "$INPUT" | python3 -c "
+import sys, json, shlex
+d = json.load(sys.stdin)
+qs = (d.get('tool_input',{}) or {}).get('questions') or []
+q = qs[0] if qs else {}
+print('export QHEADER=' + shlex.quote((q.get('header','') or '')[:40]))
+print('export QTEXT=' + shlex.quote((q.get('question','') or '')[:160]))
+" 2>/dev/null)"
+            emit attention "Input Needed" ""
+            exit 0
+        fi
         # Left = a playful gerund (Claude Code's own spinner vocabulary — the real word isn't
         # exposed to hooks, so we pick our own). Right = the concrete action: Claude's text if
         # its latest block is text, else "<verb> <target>" (file / command / pattern).
@@ -210,11 +319,19 @@ else:
            'Task':'Delegating','WebFetch':'Fetching','WebSearch':'Searching','TodoWrite':'Planning'}.get(tool,tool)
     print((label+' '+tgt).strip())
 " 2>/dev/null)
-        emit working "$(pick)…" "$PREVIEW"
+        # Mid-streak of consecutive tool failures → the agent is stuck, show "Struggling…";
+        # otherwise the normal playful gerund.
+        if [ "$(consec_tool_errors)" -ge 3 ]; then
+            emit struggling "Struggling…" "$PREVIEW"
+        else
+            emit working "$(pick)…" "$PREVIEW"
+        fi
         ;;
     post)
-        # A tool just finished. If it errored, flash an error state with the
-        # failure text; the next tool/stop event restores the normal spinner.
+        # A tool just finished. A tool error is routine — the agent reads it and recovers — so
+        # we DON'T flip to the red error state for it (that red is reserved for API/connection
+        # failures, detected daemon-side). Instead, a RUN of consecutive failures surfaces as
+        # the amber "struggling" state.
         ERR=$(echo "$INPUT" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
@@ -238,19 +355,21 @@ try:
 except: pass
 print(' '.join(msg.split())[:120])
 " 2>/dev/null)
-        if [ -n "$ERR" ]; then
-            emit error "" "$ERR"
-        else
-            # If the session was parked "Waiting for input" — an AskUserQuestion answer or
-            # a permission prompt — and the tool just completed, the user has responded and
-            # Claude is moving again. Flip the ticker back to a live thinking state instead
-            # of leaving it stuck on the stale attention label until the next prompt.
-            CURMODE=$(python3 -c "
+        CURMODE=$(python3 -c "
 import json, os
 try: print(json.load(open(os.path.expanduser('~/.claude-island/$SESSION_OUT'))).get('mode',''))
 except: print('')
 " 2>/dev/null)
-            if [ "$CURMODE" = "attention" ]; then emit thinking "Thinking…" ""; fi
+        if [ -n "$ERR" ]; then
+            # This tool failed. If it's the 3rd+ failure in a row, surface "Struggling…";
+            # otherwise stay quiet (the next PreToolUse refreshes the working verb).
+            if [ "$(consec_tool_errors)" -ge 3 ]; then emit struggling "Struggling…" "$ERR"; fi
+        else
+            # A clean tool result. If we were parked on the user (AskUserQuestion answer or a
+            # permission prompt) or stuck "Struggling…", the agent is moving again — flip back
+            # to a live state instead of leaving the stale label until the next prompt.
+            if [ "$CURMODE" = "attention" ]; then emit thinking "Thinking…" "";
+            elif [ "$CURMODE" = "struggling" ]; then emit working "$(pick)…" ""; fi
         fi
         ;;
     attention)

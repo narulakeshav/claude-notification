@@ -11,7 +11,7 @@ const APP_PATH = path.join(APP_DIR, "ClaudeIsland.app");
 const MACOS_DIR = path.join(APP_PATH, "Contents", "MacOS");
 const ISLAND_SRC = path.join(__dirname, "..", "src", "island", "island.swift");
 const SEND_SRC = path.join(__dirname, "..", "src", "island", "island-send.swift");
-const HOOK_SRC = path.join(__dirname, "..", "src", "island", "island-hook.sh");
+const HOOK_SRC = path.join(__dirname, "..", "src", "island", "island-hook.py");
 const ASSETS_DIR = path.join(__dirname, "..", "src", "island", "assets");
 const SETTINGS_PATH = path.join(HOME, ".claude", "settings.json");
 const LAUNCH_AGENTS = path.join(HOME, "Library", "LaunchAgents");
@@ -137,7 +137,7 @@ async function install() {
     process.exit(1);
   }
 
-  const hookDest = path.join(MACOS_DIR, "island-hook.sh");
+  const hookDest = path.join(MACOS_DIR, "island-hook.py");
   fs.copyFileSync(HOOK_SRC, hookDest);
   fs.chmodSync(hookDest, 0o755);
 
@@ -154,10 +154,10 @@ async function install() {
   fs.mkdirSync(LAUNCH_AGENTS, { recursive: true });
   fs.mkdirSync(EVENT_DIR, { recursive: true });
 
-  // Copy the animated icons into the (TCC-safe) event dir the daemon reads from.
+  // Copy the icons (animated .gif + still .tiff) into the (TCC-safe) event dir the daemon reads from.
   try {
-    for (const gif of fs.readdirSync(ASSETS_DIR).filter((f) => f.endsWith(".gif"))) {
-      fs.copyFileSync(path.join(ASSETS_DIR, gif), path.join(EVENT_DIR, gif));
+    for (const icon of fs.readdirSync(ASSETS_DIR).filter((f) => f.endsWith(".gif") || f.endsWith(".tiff") || f.endsWith(".png"))) {
+      fs.copyFileSync(path.join(ASSETS_DIR, icon), path.join(EVENT_DIR, icon));
     }
     done("Copied icons");
   } catch {}
