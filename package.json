@@ -25,7 +25,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/narulakeshav/claudeisland.git"
+    "url": "git+https://github.com/narulakeshav/claudeisland.git"
   },
   "homepage": "https://github.com/narulakeshav/claudeisland#readme",
   "bugs": {
