@@ -12,6 +12,7 @@ const MACOS_DIR = path.join(APP_PATH, "Contents", "MacOS");
 const ISLAND_SRC = path.join(__dirname, "..", "src", "island", "island.swift");
 const SEND_SRC = path.join(__dirname, "..", "src", "island", "island-send.swift");
 const HOOK_SRC = path.join(__dirname, "..", "src", "island", "island-hook.py");
+const STATUSLINE_SRC = path.join(__dirname, "..", "src", "island", "island-statusline.py");
 const ASSETS_DIR = path.join(__dirname, "..", "src", "island", "assets");
 const SETTINGS_PATH = path.join(HOME, ".claude", "settings.json");
 const LAUNCH_AGENTS = path.join(HOME, "Library", "LaunchAgents");
@@ -141,6 +142,10 @@ async function install() {
   fs.copyFileSync(HOOK_SRC, hookDest);
   fs.chmodSync(hookDest, 0o755);
 
+  const statuslineDest = path.join(MACOS_DIR, "island-statusline.py");
+  fs.copyFileSync(STATUSLINE_SRC, statuslineDest);
+  fs.chmodSync(statuslineDest, 0o755);
+
   execSync(`codesign --force --deep --sign - "${APP_PATH}"`, { stdio: "pipe" });
   done("Signed (ad-hoc)");
 
@@ -205,7 +210,7 @@ async function install() {
 
   const autoConfig = await ask(`Auto-configure Claude Code hooks? ${c.dim}(Y/n)${c.reset} `);
   if (autoConfig.toLowerCase() !== "n") {
-    configureHooks(hookDest);
+    configureHooks(hookDest, statuslineDest);
     done("Updated ~/.claude/settings.json");
   } else {
     log();
@@ -227,7 +232,7 @@ async function install() {
 
 // ── Hook config ───────────────────────────────────────────────────────────
 
-function configureHooks(hookDest) {
+function configureHooks(hookDest, statuslineDest) {
   let settings = {};
   if (fs.existsSync(SETTINGS_PATH)) {
     settings = JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf-8"));
@@ -235,6 +240,17 @@ function configureHooks(hookDest) {
     fs.mkdirSync(path.dirname(SETTINGS_PATH), { recursive: true });
   }
   if (!settings.hooks) settings.hooks = {};
+
+  // Statusline feed: the ONLY supported source for the live plan rate-limit % (5h / 7d), captured
+  // to ~/.claude-island/ for the notch peek. Only claim the statusLine slot if it's empty or
+  // already ours — never clobber a status line the user wrote themselves.
+  if (statuslineDest) {
+    const cur = settings.statusLine?.command || "";
+    const ours = /island-statusline|ClaudeIsland/.test(cur);
+    if (!settings.statusLine || ours) {
+      settings.statusLine = { type: "command", command: `"${statuslineDest}"`, padding: 0 };
+    }
+  }
 
   const hook = (event) => ({
     matcher: "*",
@@ -326,21 +342,35 @@ async function test() {
     process.exit(1);
   }
 
+  // The daemon only ever reloads from ~/.claude-island/sessions/<id>.json (one file per live
+  // session) — it never reads the legacy bare event.json that island-send defaults to. Target
+  // "sessions/local.json" explicitly so this actually reaches IslandState. "local" is also the
+  // one id that's always visible regardless of live-tab tracking (see `visibleSessions`).
   const push = (payload) => {
-    const child = spawn(send, [], { stdio: ["pipe", "ignore", "ignore"] });
+    const child = spawn(send, ["sessions/local.json"], { stdio: ["pipe", "ignore", "ignore"] });
     child.stdin.write(JSON.stringify(payload));
     child.stdin.end();
   };
 
   const project = path.basename(process.cwd());
+  const base = { id: "local", project, aiTitle: `Claude Code · ${project}`, cwd: process.cwd() };
+  const now = () => Math.floor(Date.now() / 1000);
+
   log();
   info("Running through the states — watch your notch…");
 
-  push({ mode: "working", title: `Claude Code · ${project}`, detail: "Working…" });
+  // kind: "prompt" seeds turnStartTs so the later "done" state shows a real elapsed timer.
+  push({ ...base, mode: "working", detail: "Working…", kind: "prompt", ts: now() });
   await sleep(2200);
-  push({ mode: "attention", title: `Claude Code · ${project}`, detail: "Needs your permission to run a command" });
+  push({ ...base, mode: "attention", detail: "Needs your permission to run a command", kind: "attention", ts: now() });
   await sleep(2600);
-  push({ mode: "done", title: `Claude Code · ${project}`, detail: "All done — tests passing" });
+  push({ ...base, mode: "done", preview: "All done — tests passing", kind: "stop", ts: now() });
+
+  // The "local" session is ALWAYS visible (it's the no-Warp-uuid fallback id), so a left-behind
+  // local.json lingers as a phantom card forever. Let the user watch the "done" state land, then
+  // delete the file — the daemon's reload() prunes any session whose file disappeared.
+  await sleep(3500);
+  try { fs.rmSync(path.join(EVENT_DIR, "sessions", "local.json")); } catch {}
 
   log();
   done("Sent test sequence");

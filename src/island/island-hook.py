@@ -13,7 +13,7 @@ session's file via `island-send` (which posts the Darwin ping the daemon listens
 Usage: island-hook.py <prompt|tool|post|attention|stop|compact|sessionstart>
 Debug: ISLAND_HOOK_DRYRUN=1 prints "<path>\n<json>" instead of spawning island-send.
 """
-import json, os, sys, subprocess, time, random
+import json, os, re, sys, subprocess, time, random
 
 EVENT = sys.argv[1] if len(sys.argv) > 1 else ""
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -23,7 +23,10 @@ ISLAND_DIR = os.environ.get("ISLAND_DIR_OVERRIDE") or os.path.expanduser("~/.cla
 TAIL_BYTES = 262_144   # 256KB transcript tail — covers titles, latest usage, previews, errors
 HEAD_BYTES = 65_536    # 64KB head — the opening prompt lives near the very top
 VERB_HOLD_S = 4.0      # re-pick the whimsical gerund at most once every few seconds (anti-flicker)
-ULTRA_WORDS = ("ultrathink",)   # Claude Code's rainbow extended-thinking keyword(s)
+# Claude Code's rainbow extended-thinking keyword. Matched on a WORD BOUNDARY (not a bare
+# substring) so "ultrathinking", "ultrathinks", or the token glued inside pasted text/URLs
+# don't false-trigger the rainbow — only the literal word "ultrathink" does.
+ULTRA_RE = re.compile(r"\bultrathink\b")
 
 # Whimsical status verbs in the spirit of Claude Code's own spinner (the real word isn't
 # exposed to hooks). Held for VERB_HOLD_S so a fast tool burst doesn't churn the word.
@@ -193,20 +196,33 @@ def compute_firstprompt(transcript):
 
 
 def tool_preview(d, entries):
-    """Right-side action: Claude's latest text if its last block is text, else
-    '<verb> <target>' from the tool about to run (file / command / pattern)."""
-    last_kind, last_text = "", ""
+    """Right-side action: Claude's latest commentary this turn, else '<verb> <target>' from the
+    tool about to run (file / command / pattern)."""
+    # Prefer Claude's own prose. Claude Code writes each content block as its OWN transcript entry
+    # — a turn is a run of separate assistant lines like [thinking], [text "Let me check X"],
+    # [tool_use Read], then a [tool_result] user line — so the narration is NOT in the latest
+    # (tool-only) entry. Walk back through the current turn, skipping thinking / tool-only assistant
+    # lines and tool_result/meta user lines, to the most recent assistant text block. Stop at a real
+    # typed user prompt (the turn boundary) so we never surface prose from an earlier turn.
+    last_text = ""
     for e in reversed(entries):
-        if e.get("type") != "assistant":
+        t = e.get("type")
+        if t == "user":
+            if e.get("isMeta"):
+                continue   # tool_result / system-injected — not a turn boundary
+            if real(user_text((e.get("message") or {}).get("content", ""))):
+                break       # a genuine prompt: end of this turn, stop here
+            continue
+        if t != "assistant":
             continue
         c = (e.get("message") or {}).get("content", "")
-        if isinstance(c, list) and c:
-            last_kind = c[-1].get("type", "")
-            texts = [b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text"]
+        if isinstance(c, list):
+            texts = [b.get("text", "") for b in c
+                     if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip()]
             if texts:
                 last_text = texts[-1]
-        break
-    if last_kind == "text" and last_text.strip():
+                break
+    if last_text.strip():
         return last_text.strip().split("\n")[0][:60]
     tool = d.get("tool_name", "")
     ti = d.get("tool_input", {}) or {}
@@ -342,7 +358,7 @@ def main():
     if EVENT == "prompt":
         # Turn just started: thinking, no narration yet. Seed a fresh verb for the new turn so
         # the first tool within VERB_HOLD_S reuses it (and a new turn always gets a new word).
-        ultra = any(w in (d.get("prompt", "") or "").lower() for w in ULTRA_WORDS)
+        ultra = bool(ULTRA_RE.search((d.get("prompt", "") or "").lower()))
         emit("thinking", "Thinking…", "", vw=random.choice(GERUNDS), vt=ts)
 
     elif EVENT == "tool":
@@ -396,6 +412,12 @@ def main():
             # no Stop), so settle it to a calm "Finished" rather than a stuck spinner.
             if curmode in ("working", "thinking"):
                 emit("done", "", "", vw=prev_vw, vt=prev_vt)
+        elif curmode == "attention":
+            # Already parked in attention — almost always an AskUserQuestion pause (the only
+            # other way in here), and Claude Code's own Notification hook fires again for that
+            # same pause. Don't stomp its "Input Needed" label with the generic "Permission" —
+            # just refresh the heartbeat so the card doesn't look stale.
+            emit("attention", prev.get("detail") or "Input Needed", keep=True, vw=prev_vw, vt=prev_vt)
         else:
             # Permission: keep the pending tool action (from the preceding PreToolUse) on the
             # right, label the left "Permission".

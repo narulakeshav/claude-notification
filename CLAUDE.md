@@ -28,4 +28,4 @@ The island is a non-activating `NSPanel`: SwiftUI's animation clock doesn't tick
 - `~/.claude/projects/<slug>/<id>.jsonl` — CC transcript (titles/preview/prompt/context). Types: `user` (skip `isMeta`/tool_result), `assistant`, `ai-title`, `custom-title`.
 
 ## Flags
-- `kRowTitleUsesPrompt` (top of `island.swift`): dropdown rows lead with opening prompt vs tab name. Done/stale rows show the agent's response regardless.
+- `kRowTitleUsesPrompt` (top of `island.swift`): dropdown rows lead with the latest user prompt (falls back to the opening prompt, then tab name) vs tab name. Done/stale rows show the agent's response regardless.

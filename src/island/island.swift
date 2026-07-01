@@ -111,6 +111,8 @@ struct DropdownItem: Identifiable {
     let header: String?       // non-nil → section header label
     let card: SessionCard?    // non-nil → session row
     var titleInHeader = false // row's tab name already shown by its header → row omits it
+    // Git context for a repo/branch header (empty hRepo → render `header` as a plain label).
+    var hRepo = ""; var hBranch = ""; var hFiles = 0; var hAdded = 0; var hRemoved = 0
     var isHeader: Bool { header != nil }
 }
 
@@ -129,6 +131,14 @@ func idleSessionsLabel(_ n: Int) -> String {
 /// only once the window is ≥25% full, and never on the grey idle/stale rows.
 func ringVisible(_ card: SessionCard) -> Bool {
     card.context >= 0.25 && card.status != "idle" && card.status != "stale"
+}
+
+/// Context-ring fill (and the matching "x% context" text) — warns as the window fills:
+/// white < 30%, amber 30–50%, red > 50%.
+func contextFillColor(_ pct: Double) -> Color {
+    if pct > 0.5  { return Color(red: 0.898, green: 0.282, blue: 0.302) }  // red
+    if pct > 0.30 { return Color(red: 1.0, green: 0.745, blue: 0.0) }      // amber
+    return .white
 }
 
 /// Truncated card label (title or, if empty, project), matching what the view draws.
@@ -170,7 +180,7 @@ final class IslandState: ObservableObject {
     // fields above still mirror the front tab (harmless — the view ignores them while
     // `aggregate` is true).
     @Published var aggregate = false   // render the count pill, not the single-session one
-    @Published var runningCount = 0    // working / thinking / compacting / compacted
+    @Published var runningCount = 0    // working / thinking / compacting / struggling
     @Published var needYouCount = 0    // attention only — sessions you can actually act on
     @Published var doneCount = 0       // done within 15m (stale ones drop out)
     @Published var errorCount = 0      // errored: terminal, NOT actionable — never "need you"
@@ -204,6 +214,9 @@ final class IslandState: ObservableObject {
     @Published var dropdownItems: [DropdownItem] = []   // roster grouped by project (+ headers)
     @Published var dropdownOpen = false
     @Published var hoveredRow: String? = nil    // dropdown row under the cursor
+    @Published var hoveredGroup: String? = nil  // group (repo/branch) under the cursor — a row OR its header
+    @Published var selectedGroup: String? = nil // the selected/active session's group — the resting "expanded" header
+    @Published var selectedId: String? = nil    // the selected/active session id — its context drives the header ring
     @Published var hoveredRing: String? = nil   // dropdown row whose context ring is hovered
     // When opened by hovering an aggregate count, the dropdown shows only that status bucket
     // ("attention"/"running"/"done"/"error"); empty = the full list (opened via the {n} ⌄ peek).
@@ -216,6 +229,13 @@ final class IslandState: ObservableObject {
     // "Happy Clauding". "Session" = rolling last 5h (Claude's usage-window length).
     @Published var usageSession = ""
     @Published var usageToday = ""
+    // Real plan rate-limit % (from Claude Code's statusline `rate_limits`, captured by
+    // island-statusline.py). "47" etc., or "" when unavailable (non-Max, or pre-first-response).
+    // The 5h window is what Claude's plans call your "Session"; seven_day is the weekly cap.
+    @Published var rlSession = ""   // five_hour used_percentage
+    @Published var rlWeek = ""      // seven_day used_percentage
+    @Published var rlSessionReset = 0.0   // five_hour resets_at (epoch secs; 0 = none)
+    @Published var rlWeekReset = 0.0      // seven_day resets_at
     // Front session's "ultrathink" flag — paints the single-session pill's verb in a rainbow.
     @Published var ultra = false
 
@@ -255,10 +275,24 @@ struct SessionCard: Identifiable {
     var context: Double = 0  // 0…1 context-window fill, for the per-row ring
     var preview: String = "" // latest action / message, shown grey after the title
     var firstPrompt: String = "" // session's opening user message (row-title experiment)
+    var lastUserMsg: String = "" // session's most recent user message, for the dropdown row title
     var qHeader: String = ""  // pending AskUserQuestion: short topic label (attention rows)
     var qText: String = ""    // pending AskUserQuestion: full question text (attention rows)
     var subagentCount: Int = 0  // live subagents (Task tool), shown as "{n} agents" left of the timer
     var ultra = false  // "ultrathink" turn → paint the verb in a rainbow gradient
+    // Git context (local probe by cwd). Dropdown groups sessions by repo + branch so each
+    // worktree is its own labelled section; the header carries the working-tree churn.
+    var repo: String = ""     // repo name (shared across a repo's worktrees), e.g. "claude-notification"
+    var branch: String = ""   // current branch, e.g. "main" / "test-worktree"
+    var files: Int = 0        // uncommitted files changed (vs HEAD)
+    var added: Int = 0        // + lines
+    var removed: Int = 0      // − lines
+    // Group key: repo/branch when known, else the bare project dir (pre-git-probe / non-repo).
+    var groupKey: String {
+        if !branch.isEmpty { return (repo.isEmpty ? project : repo) + "/" + branch }
+        if !repo.isEmpty { return repo }
+        return project.isEmpty ? "Claude Code" : project
+    }
 }
 
 struct EventPayload: Decodable {
@@ -400,6 +434,168 @@ struct Marquee: View {
             .init(color: .black, location: 1 - f),
             .init(color: .clear, location: 1),
         ], startPoint: .leading, endPoint: .trailing)
+    }
+}
+
+/// Paces the peek's message feed so every line is readable. Previews arrive at the hook's
+/// PreToolUse cadence — wildly uneven (a fast Read flashes a commentary line for ms; a slow Bash
+/// holds one for seconds). `submit()` enqueues each distinct line; a self-stepped pacer advances
+/// the displayed line only after a minimum dwell, so nothing flickers past unread. The dwell
+/// shrinks as the backlog grows (the queue self-drains, so it never lags far behind reality).
+/// Two more self-stepped ramps drive the look: `slide` (0→1, the vertical push on each swap) and
+/// `tint` (0→1, a freshly-shown line enters white and settles to the peek grey over ~3s). All
+/// timer-driven because SwiftUI's animation clock is frozen in this non-activating panel.
+final class PeekFeed: ObservableObject {
+    @Published var cur = ""
+    @Published var prev = ""
+    @Published var slide: CGFloat = 1     // 1 = settled, 0 = mid-swap
+    @Published var tint: CGFloat = 1      // 0 = white (just shown), 1 = settled to peek grey
+
+    private var queue: [String] = []
+    private var shownAt: CFTimeInterval = 0
+    private var pacer: Timer?
+    private var slideTimer: Timer?
+    private var tintTimer: Timer?
+
+    func submit(_ text: String) {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        // First line on (re)appear: show at once, already settled (not "new"), no white flash.
+        if cur.isEmpty && queue.isEmpty {
+            cur = t; shownAt = CACurrentMediaTime(); slide = 1; tint = 1
+            return
+        }
+        if t == cur || t == queue.last { return }    // dedupe the carry / repeat emits
+        queue.append(t)
+        if queue.count > 5 { queue.removeFirst(queue.count - 5) }   // bound lag: keep the latest few
+        ensurePacer()
+    }
+
+    func stop() {
+        pacer?.invalidate(); pacer = nil
+        slideTimer?.invalidate(); slideTimer = nil
+        tintTimer?.invalidate(); tintTimer = nil
+    }
+
+    private func ensurePacer() {
+        guard pacer == nil else { return }
+        let t = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(t, forMode: .common)
+        pacer = t
+    }
+
+    private func tick() {
+        if slide < 1 { return }                       // let the current swap finish first
+        guard !queue.isEmpty else { pacer?.invalidate(); pacer = nil; return }
+        if CACurrentMediaTime() - shownAt >= dwell(queue.count) { advance() }
+    }
+
+    // More backlog → shorter dwell, so a burst of fast tools drains instead of piling up.
+    private func dwell(_ n: Int) -> CFTimeInterval {
+        switch n {
+        case 0, 1: return 2.2
+        case 2:    return 1.6
+        case 3:    return 1.1
+        default:   return 0.7
+        }
+    }
+
+    private func advance() {
+        prev = cur
+        cur = queue.removeFirst()
+        shownAt = CACurrentMediaTime()
+        startSlide()
+        startTint()
+    }
+
+    private func startSlide() {
+        slideTimer?.invalidate(); slide = 0
+        let start = CACurrentMediaTime(); let dur: CFTimeInterval = 0.34
+        let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let e = min(1, (CACurrentMediaTime() - start) / dur)
+            self.slide = 1 - pow(1 - CGFloat(e), 2.2)            // ease-out
+            if e >= 1 { self.slideTimer?.invalidate(); self.slideTimer = nil }
+        }
+        RunLoop.main.add(t, forMode: .common); slideTimer = t
+    }
+
+    private func startTint() {
+        tintTimer?.invalidate(); tint = 0
+        let start = CACurrentMediaTime(); let dur: CFTimeInterval = 3.0
+        let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let e = min(1, (CACurrentMediaTime() - start) / dur)
+            self.tint = CGFloat(e * e * (3 - 2 * e))            // smoothstep: holds white, eases to grey
+            if e >= 1 { self.tintTimer?.invalidate(); self.tintTimer = nil }
+        }
+        RunLoop.main.add(t, forMode: .common); tintTimer = t
+    }
+}
+
+/// The peek's message line, advanced like a paced rolling queue (see `PeekFeed`): the old line
+/// rises + fades out the top while the new line rises in from the bottom + fades in. A newly-shown
+/// line enters white and settles to the peek grey over ~3s. Each line is still a `Marquee` (a long
+/// message scrolls horizontally once settled). Vertical motion is clipped to one line.
+struct QueuePeek: View {
+    let text: String
+    let baseWhite: Double          // settled peek grey (e.g. 0.66); a new line starts at white 1.0
+    let width: CGFloat
+    @ObservedObject var clock: MarqueeClock
+    @StateObject private var feed = PeekFeed()
+    private let lineH: CGFloat = 15
+
+    var body: some View {
+        ZStack {
+            if !feed.prev.isEmpty && feed.slide < 1 {
+                Marquee(text: feed.prev, color: Color(white: baseWhite), width: width, clock: clock)
+                    .offset(y: -lineH * feed.slide)
+                    .opacity(Double(max(0, 1 - feed.slide * 1.5)))
+            }
+            Marquee(text: feed.cur, color: curColor, width: width, clock: clock)
+                .offset(y: lineH * (1 - feed.slide))
+                .opacity(Double(min(1, feed.slide * 1.5)))
+        }
+        .frame(width: width, height: lineH)
+        .clipped()
+        .onAppear { feed.submit(text) }
+        .onDisappear { feed.stop() }
+        .onChange(of: text) { feed.submit($0) }
+    }
+
+    // White at tint=0, settling to the peek grey at tint=1.
+    private var curColor: Color { Color(white: 1.0 - (1.0 - baseWhite) * feed.tint) }
+}
+
+/// Small fill bar for the notch usage peek: a dim track with a colored fill proportional to
+/// `fraction` (0...1), in the same color the percent label uses.
+struct UsageBar: View {
+    let fraction: Double
+    let color: Color
+    private static let w: CGFloat = 56
+    private static let h: CGFloat = 5
+
+    var body: some View {
+        let f = min(max(fraction, 0), 1)
+        let fillW = max(Self.h, Self.w * CGFloat(f))
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: Self.h / 2)
+                .fill(Color.white.opacity(0.16))
+            RoundedRectangle(cornerRadius: Self.h / 2)
+                .fill(LinearGradient(colors: [color.opacity(0.45), color],
+                                      startPoint: .leading, endPoint: .trailing))
+                .frame(width: fillW)
+            // Soft glow at the fill's leading tip, like a charging indicator.
+            if f > 0.02 && f < 1 {
+                Circle()
+                    .fill(color)
+                    .frame(width: Self.h, height: Self.h)
+                    .blur(radius: 1.2)
+                    .offset(x: fillW - Self.h / 2)
+            }
+        }
+        .frame(width: Self.w, height: Self.h)
+        .shadow(color: color.opacity(0.25), radius: 1.2, x: 0, y: 0)
     }
 }
 
@@ -570,10 +766,10 @@ struct IslandView: View {
                 if state.dropdownOpen { expandedSheet }
                 // The resting idle pill ("{n} idle sessions") is its own hover-to-open target,
                 // so it skips the "{n} ⌄" back-pill affordance (which would double the count).
-                if state.roster.count > 1 && state.mode != .idle { agentsBackPill }
+                if state.roster.count >= 1 && state.mode != .idle { agentsBackPill }
                 island
                 if state.dropdownOpen { dropdownList }
-                if state.roster.count > 1 && state.mode != .idle { agentsLabel }
+                if state.roster.count >= 1 && state.mode != .idle { agentsLabel }
             } else {
                 // Back cards are SIBLINGS of the island (not its background) so each
                 // card's full frame is hit-testable.
@@ -589,6 +785,8 @@ struct IslandView: View {
         .animation(.spring(response: 0.3, dampingFraction: 0.9), value: state.dropdownOpen)
         .animation(.spring(response: 0.5, dampingFraction: 0.64), value: state.frontHovered)
         .animation(.easeOut(duration: 0.12), value: state.hoveredRow)
+        .animation(.easeOut(duration: 0.12), value: state.hoveredGroup)
+        .animation(.easeOut(duration: 0.12), value: state.selectedGroup)
         // Grow/shrink the bar smoothly when its width changes (verb/preview text updates)
         // instead of snapping to the new size.
         .animation(.spring(response: 0.35, dampingFraction: 0.9), value: pillWidth)
@@ -772,7 +970,7 @@ struct IslandView: View {
     private var dropdownList: some View {
         VStack(spacing: 0) {
             ForEach(state.dropdownItems) { item in
-                if let h = item.header { dropdownHeader(h) }
+                if item.isHeader { dropdownHeader(item) }
                 else if let c = item.card { dropdownRow(c, titleInHeader: item.titleInHeader) }
             }
         }
@@ -781,18 +979,72 @@ struct IslandView: View {
         .zIndex(-1)
     }
 
-    // A project section header — a small, dim label above its group of rows.
-    private func dropdownHeader(_ title: String) -> some View {
+    // A repo/branch section header: "repo" (dim) + "/branch" (white) + "· N files +X −Y" churn,
+    // above its group of rows. Non-git groups (e.g. the attention view's tab-name header) render
+    // their plain label.
+    private func dropdownHeader(_ item: DropdownItem) -> some View {
         HStack(spacing: 0) {
-            Text(title)
+            headerLabel(item, active: headerActive(item))
                 .font(.custom(kSansFontName, size: 11))
-                .foregroundColor(Color.white.opacity(0.5))
                 .lineLimit(1)
-            Spacer(minLength: 0)
+            Spacer(minLength: 8)
+            // Context fill of the active session, floated to the header's right edge: a ring +
+            // "x% context" in the ring's own color. Only on the active header, ≥25% full.
+            if let ctx = headerContext(item), ctx >= 0.25 {
+                HStack(spacing: 5) {
+                    ContextRing(pct: ctx)
+                    Text("\(Int((ctx * 100).rounded()))% context used")
+                        .font(.custom(kSansFontName, size: 11))
+                        .foregroundColor(contextFillColor(ctx))
+                        .fixedSize()
+                }
+            }
         }
         .padding(.horizontal, 16)
         .padding(.bottom, 2)   // a little breathing room between the label and its first row
         .frame(width: sheetWidth - 2 * kRowInset, height: kHeaderHeight, alignment: .bottomLeading)
+    }
+
+    // Context fill driving the active header's ring: the hovered row's session, else the
+    // selected one; falls back to the group's representative card.
+    private func headerContext(_ item: DropdownItem) -> Double? {
+        guard headerActive(item) else { return nil }
+        let group = String(item.id.dropFirst(4))   // strip "hdr:"
+        // Context is PER SESSION, but a header can span several sessions in one repo/branch group —
+        // showing one session's % under a multi-session label would misread as an aggregate. So only
+        // surface it when the group is a single session (then label ⇔ session, unambiguous).
+        let cards = state.roster.filter { $0.groupKey == group }
+        guard cards.count == 1 else { return nil }
+        return cards.first?.context
+    }
+
+    // Exactly ONE header is "active": the group under the cursor, or — when nothing's hovered —
+    // the selected/active session's group. Only that header expands to show churn, in white.
+    private func headerActive(_ item: DropdownItem) -> Bool {
+        guard let g = state.hoveredGroup ?? state.selectedGroup else { return false }
+        return item.id == "hdr:\(g)"
+    }
+
+    // Resting: a dim "dirname · branch". Active: only the branch/worktree whitens, and the churn
+    // detail "· N files · +x −y" grows in (dirname stays grey throughout; +green/−red for churn).
+    private func headerLabel(_ item: DropdownItem, active: Bool) -> Text {
+        let grey = Color.white.opacity(0.5)
+        guard !item.hRepo.isEmpty else { return Text(item.header ?? "").foregroundColor(grey) }
+        let sep = Text("  ·  ").foregroundColor(grey)
+        var t = Text(item.hRepo).foregroundColor(grey)   // dirname: always grey
+        if !item.hBranch.isEmpty { t = t + sep + Text(item.hBranch).foregroundColor(active ? .white : grey) }
+        if active, item.hFiles > 0 {
+            t = t + sep + Text("\(item.hFiles) file\(item.hFiles == 1 ? "" : "s")").foregroundColor(grey)
+            if item.hAdded > 0 || item.hRemoved > 0 {
+                t = t + sep
+                if item.hAdded > 0 { t = t + Text("+\(item.hAdded)").foregroundColor(IslandView.green) }
+                if item.hRemoved > 0 {
+                    if item.hAdded > 0 { t = t + Text(" ") }
+                    t = t + Text("−\(item.hRemoved)").foregroundColor(IslandView.red)
+                }
+            }
+        }
+        return t
     }
 
 
@@ -848,16 +1100,31 @@ struct IslandView: View {
         let isEscTerminal = card.status == "declined" || card.status == "interrupted"
         // An API/connection error leads with its message (promoted to the title) behind a red prefix.
         let isError = card.status == "error"
+        // Finished rows lead with the (frozen, green) turn timer — "[dot] [12s] [response]" —
+        // instead of trailing it on the right, where it duplicated what the peek already shows.
+        let timerOnLeft = (card.status == "done" || card.status == "stale") && !card.elapsed.isEmpty
         return HStack(spacing: 10) {
             rowMarker(card.status, ultra: card.ultra && card.status == "thinking")
+            if timerOnLeft {
+                Text(card.elapsed)
+                    .font(.custom(kSansFontName, size: 12))
+                    .monospacedDigit()
+                    .foregroundColor(card.status == "done" ? IslandView.green : Color.white.opacity(0.55))
+                    .lineLimit(1)
+                    .fixedSize()
+            }
             Group {
                 // Each row leads with a colored state word ahead of the tab's title, so the
                 // list reads as "what is it doing" at a glance: the live verb while working
                 // ("Editing"), "Thinking…", "Compacting…", "Compacted", or "Input Needed".
                 // The verb tracks the session's `detail` and so updates live as it works.
                 let titleText = card.title.isEmpty ? card.project : card.title
+                // In-progress rows track the LATEST prompt (falls back to the opening one,
+                // then the tab title) so a follow-up message updates the row immediately
+                // instead of sticking to what kicked the session off.
+                let livePrompt = card.lastUserMsg.isEmpty ? card.firstPrompt : card.lastUserMsg
                 let rowLabel = (isFinished || isEscTerminal || isError) ? (card.preview.isEmpty ? titleText : card.preview)
-                    : ((kRowTitleUsesPrompt && !card.firstPrompt.isEmpty) ? card.firstPrompt : titleText)
+                    : ((kRowTitleUsesPrompt && !livePrompt.isEmpty) ? livePrompt : titleText)
                 let name = Text(rowLabel).foregroundColor(titleColor)
                 if card.status == "working", !card.verb.isEmpty {
                     verbRun(card.verb + " ", color: IslandView.coral, ultra: false) + name
@@ -940,29 +1207,9 @@ struct IslandView: View {
                 .background(Capsule(style: .continuous).fill(IslandView.coral.opacity(0.16)))
                 .padding(.trailing, 3)
             }
-            // Per-session context-window fill, mirroring the front pill's ring — only for
-            // active/done rows, not the grey ones (idle / stale). Sits LEFT of the timer.
-            // Hovering it floats a small label above (SwiftUI hover can't fire in this panel,
-            // so the controller's mouse hit-test drives `hoveredRing`).
-            if ringVisible(card) {
-                ContextRing(pct: card.context)
-                    .overlay(alignment: .top) {
-                        if state.hoveredRing == card.id {
-                            Text("\(Int((card.context * 100).rounded()))% context used")
-                                .font(.custom(kSansFontName, size: 11))
-                                .foregroundColor(.white)
-                                .fixedSize()
-                                .padding(.horizontal, 9)
-                                .padding(.vertical, 5)
-                                .background(Capsule(style: .continuous).fill(Color.black.opacity(0.92)))
-                                .overlay(Capsule(style: .continuous).stroke(Color.white.opacity(0.1), lineWidth: 1))
-                                .offset(y: -20)
-                                .zIndex(100)
-                                .allowsHitTesting(false)
-                        }
-                    }
-            }
-            if !card.elapsed.isEmpty {
+            // (Context ring moved to the group header — floated right as "ring + x% context".)
+            // Active rows keep the timer on the right; finished rows moved it to the left.
+            if !card.elapsed.isEmpty && !timerOnLeft {
                 Text(card.elapsed)
                     .font(.custom(kSansFontName, size: 12))
                     .monospacedDigit()
@@ -1084,6 +1331,9 @@ struct IslandView: View {
                 .tracking(0.5)
                 .lineLimit(1)
                 .fixedSize()
+                // Same white sweep as the flat verb — rides over the rainbow letters.
+                .modifier(ShimmerText(active: verbShimmers,
+                                      width: textWidth(primary, IslandView.serifFont, tracking: 0.5)))
         } else {
             Text(primary)
                 .font(.custom(kSerifFontName, size: 13))
@@ -1129,10 +1379,14 @@ struct IslandView: View {
         if state.aggregate { return aggRight }
         switch state.mode {
         case .thinking:                  return state.elapsed
-        // When a working event has no verb, the preview is promoted to the left as the
-        // verb — so suppress it here to avoid showing the same text on both sides.
-        case .working:                   return state.detail.isEmpty ? "" : clip(state.preview)
-        case .done, .attention, .error:  return clip(state.preview)
+        // Working: the agent's live reply now lives in the hover peek, so the right side shows the
+        // session's AI tab name (its directory until it's earned one) — a calmer "which convo",
+        // matching the finished state below.
+        case .working:                   return clip(state.title)
+        // Finished: the agent's reply already lives in the hover peek, so the right side shows the
+        // session's AI tab name (its directory until it's earned one) — a calmer "which convo".
+        case .done:                      return clip(state.title)
+        case .attention, .error:         return clip(state.preview)
         case .compacting, .compacted:    return ""
         case .idle:                      return idleSessionsLabel(state.idleSessionCount)
         }
@@ -1193,21 +1447,23 @@ struct IslandView: View {
                 .fill(state.dropdownOpen ? Color.clear : Color.black)
         )
         .overlay(alignment: .bottom) {
-            // Notch → a static "Happy Clauding". A finished session shows the agent's final
-            // response (preview); otherwise the front session's latest user message (falling
-            // back to its title). Scrolled as a news-ticker marquee if it overflows.
-            let peekText = (state.mode == .done && !state.preview.isEmpty) ? state.preview
+            // Notch → a static "Happy Clauding". While the agent is actively replying (working)
+            // or just finished, the peek shows its live/final response (preview). While thinking
+            // (no reply yet) it shows the user's latest message instead. Marquee'd if it overflows.
+            let showResponse = !state.preview.isEmpty
+                && (state.mode == .working || state.mode == .done)
+            let peekText = showResponse ? state.preview
                 : (state.lastUserMsg.isEmpty ? state.title : state.lastUserMsg)
             if frontPeekH > 0 && (state.notchPeek || !peekText.isEmpty) {
                 Group {
                     if state.notchPeek {
-                        usagePeekText
+                        usagePeekView
                             .font(.custom(kSansFontName, size: 11))
                             .lineLimit(1)
                             .frame(maxWidth: pillWidth - 28)
                     } else {
-                        Marquee(text: peekText, color: Color(white: 0.66),
-                                width: pillWidth - 28, clock: MarqueeClock.shared)
+                        QueuePeek(text: peekText, baseWhite: 0.66,
+                                  width: pillWidth - 28, clock: MarqueeClock.shared)
                     }
                 }
                 .padding(.bottom, 5)
@@ -1229,19 +1485,66 @@ struct IslandView: View {
         .offset(x: islandOffset)
     }
 
-    // Notch-hover peek: "Session: <n> tokens · Today: <n> tokens" — grey labels, white values.
-    // Falls back to "Happy Clauding" until the usage rollup has data. (Text `+` is deprecated but
-    // is how the codebase composes multi-color runs — keeps per-segment color under one font.)
-    private var usagePeekText: Text {
-        guard !(state.usageSession.isEmpty && state.usageToday.isEmpty) else {
-            return Text("Happy Clauding").foregroundColor(.white)
-        }
+    // Notch-hover peek: "Session [▓▓▓░░░] 16% context · resets in 57m" — a fill bar + percent
+    // in the same color, reset time in white. Falls back to the locally-tallied absolute token
+    // windows, then to the playful resting text, when the real plan limit isn't available yet.
+    // "This Week" (7d) is still computed (`rlWeek`) but hidden here — may resurface later.
+    @ViewBuilder
+    private var usagePeekView: some View {
         let grey = Color(white: 0.55)
-        let sess = Text("Session: ").foregroundColor(grey)
-            + Text(state.usageSession + " tokens").foregroundColor(.white)
-        let today = Text("Today: ").foregroundColor(grey)
-            + Text(state.usageToday + " tokens").foregroundColor(.white)
-        return sess + Text("  ·  ").foregroundColor(grey) + today
+        if !state.rlSession.isEmpty {
+            let pct = Int(state.rlSession) ?? 0
+            let barColor = pctColor(state.rlSession)
+            let textColor = pctTextColor(state.rlSession)
+            let reset = fmtReset(state.rlSessionReset)
+            HStack(spacing: 6) {
+                Text("Session").foregroundColor(grey)
+                UsageBar(fraction: Double(pct) / 100, color: barColor)
+                Text("\(pct)% context used").foregroundColor(barColor)
+                if !reset.isEmpty {
+                    Text("·").foregroundColor(textColor)
+                    Text("resets in \(reset)").foregroundColor(textColor)
+                }
+            }
+        } else if !(state.usageSession.isEmpty && state.usageToday.isEmpty) {
+            let sess = Text("Session: ").foregroundColor(grey)
+                + Text(state.usageSession + " tokens").foregroundColor(.white)
+            let today = Text("Today: ").foregroundColor(grey)
+                + Text(state.usageToday + " tokens").foregroundColor(.white)
+            sess + Text("  ·  ").foregroundColor(grey) + today
+        } else {
+            Text("Happy Clauding").foregroundColor(.white)
+        }
+    }
+
+    // Bar fill: white below 60% → yellow 60-85% → red past 85%, so a tight context window
+    // reads at a glance.
+    private func pctColor(_ s: String) -> Color {
+        let v = Int(s) ?? 0
+        if v >= 85 { return IslandView.red }
+        if v >= 60 { return IslandView.amber }
+        return .white
+    }
+
+    // Labels (percent + reset time): quiet grey below 60%, only picking up the warning color
+    // once usage is actually worth flagging.
+    private func pctTextColor(_ s: String) -> Color {
+        let v = Int(s) ?? 0
+        if v >= 85 { return IslandView.red }
+        if v >= 60 { return IslandView.amber }
+        return Color(white: 0.55)
+    }
+
+    // Time until a rate-limit window resets, from its epoch `resets_at`: "3d 2h" / "2h 14m" / "57m".
+    // "" when there's no reset or it's already past (the next render picks up the fresh window).
+    private func fmtReset(_ epoch: Double) -> String {
+        guard epoch > 0 else { return "" }
+        let secs = Int(epoch - Date().timeIntervalSince1970)
+        guard secs > 0 else { return "" }
+        let d = secs / 86_400, h = (secs % 86_400) / 3600, m = (secs % 3600) / 60
+        if d > 0 { return "\(d)d \(h)h" }
+        if h > 0 { return "\(h)h \(m)m" }
+        return "\(max(1, m))m"
     }
 
     // Extra height the front pill takes on hover (0 normally). Suppressed while the
@@ -1430,22 +1733,17 @@ struct Spinner: View {
 /// arc swept clockwise from 12 o'clock — white when low, amber past a third, red past half.
 struct ContextRing: View {
     let pct: Double
-    // Warn as the window fills: white < 30%, amber 30–50%, red > 50%.
-    private var fillColor: Color {
-        if pct > 0.5  { return Color(red: 0.898, green: 0.282, blue: 0.302) }  // red
-        if pct > 0.30 { return Color(red: 1.0, green: 0.745, blue: 0.0) }      // amber
-        return .white
-    }
+    private var fillColor: Color { contextFillColor(pct) }
     var body: some View {
         ZStack {
             Circle()
-                .stroke(Color(white: 0.62).opacity(0.55), lineWidth: 2)
+                .stroke(Color(white: 0.62).opacity(0.55), lineWidth: 1.5)
             Circle()
                 .trim(from: 0, to: max(0.02, min(1, pct)))
-                .stroke(fillColor, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                .stroke(fillColor, style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
                 .rotationEffect(.degrees(-90))
         }
-        .frame(width: 12, height: 12)
+        .frame(width: 9, height: 9)
         .animation(.easeOut(duration: 0.3), value: pct)
     }
 }
@@ -1456,7 +1754,22 @@ struct ContextRing: View {
 /// becomes key — otherwise the first click on the island/chevron is swallowed by the
 /// window server instead of reaching SwiftUI's tap gestures.
 final class ClickableHostingView<Content: View>: NSHostingView<Content> {
+    var onMove: (() -> Void)?
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    // The panel is non-activating and never key, so mouse-MOVED events are never delivered to it
+    // — the controller's NSEvent monitors only see moves OUTSIDE our window, so hover froze the
+    // moment the cursor entered the open sheet. A tracking area is the one mechanism that fires
+    // mouseMoved INSIDE a non-key window, so we forward those to the controller's hover update.
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for a in trackingAreas { removeTrackingArea(a) }
+        addTrackingArea(NSTrackingArea(rect: .zero,
+                                       options: [.mouseMoved, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+    override func mouseMoved(with event: NSEvent) { onMove?(); super.mouseMoved(with: event) }
+    override func mouseExited(with event: NSEvent) { onMove?(); super.mouseExited(with: event) }
 }
 
 final class NotchPanel: NSPanel {
@@ -1539,6 +1852,9 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var dropdownFrozenOrder: [String]?  // row id order locked while the menu is open,
                                                 // so rows don't reshuffle under the cursor
     private var frontUUID: String?              // current front-pill session
+    private var lastSingleFocus: String?        // the tab that last held the front as the lone
+                                                // running session; lets its completion keep the
+                                                // single "Finished" pill instead of an aggregate count
 
     // Live pill geometry, reported by the view (which computes it deterministically).
     // The mouse monitor hit-tests the cursor against this — both use the same numbers,
@@ -1569,6 +1885,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         let hosting = ClickableHostingView(rootView: IslandView())
         hosting.frame = NSRect(x: 0, y: 0, width: 1100, height: 160)
         hosting.autoresizingMask = [.width, .height]
+        hosting.onMove = { [weak self] in self?.updateHover() }   // track hover INSIDE the panel
 
         panel = NotchPanel()
         panel.contentView = hosting
@@ -1657,9 +1974,10 @@ final class AppController: NSObject, NSApplicationDelegate {
                 let overIsland = pointInIslandHitArea(p)
                 panel.ignoresMouseEvents = !overIsland
                 if s.idleSessionCount >= 1 {
-                    // Persistent "{n} idle sessions" pill. Hovering the literal notch peeks the
-                    // token-usage stats; hovering the count text drops the roster list. Leaving
-                    // closes the list but the PILL STAYS (the count is always visible).
+                    // Revealed "{n} idle sessions" pill. Hovering the literal notch peeks the
+                    // token-usage stats; hovering the count text drops the roster list. Idle is a
+                    // hidden regime, so once the cursor leaves the notch + pill (dropdown closed)
+                    // the pill tucks back away — it isn't a persistent fixture.
                     let overNotch = !s.dropdownOpen && pointInNotchRegion(p)
                     if s.notchPeek != overNotch {
                         s.notchPeek = overNotch
@@ -1672,6 +1990,7 @@ final class AppController: NSObject, NSApplicationDelegate {
                         closeDropdown()
                     }
                     updateRowHover(p: p, f: panel.frame)
+                    if !inZone && !overIsland && !s.dropdownOpen { hideIdlePeek() }
                     return
                 }
                 // No idle sessions: the transient "Idle" peek hides once you leave it.
@@ -1716,7 +2035,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         // expanded sheet closes it. (SwiftUI's onHover never fires in this non-key panel, so
         // we drive it from the monitor.) Once open, `overIsland` covers the whole sheet.
         if s.uiMode == "dropdown" {
-            if s.roster.count > 1 {
+            if s.roster.count >= 1 {
                 if !s.dropdownOpen {
                     if pointInBackPillPeek(p) {
                         s.dropdownFilter = ""
@@ -1784,7 +2103,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         var right = center + curPillWidth / 2
         var bottom = f.maxY - islandH
         let top = f.maxY
-        if s.roster.count > 1 && s.mode != .idle { right += kAgentsPeek }  // "{n} ⌄" back pill peeks right
+        if s.roster.count >= 1 && s.mode != .idle { right += kAgentsPeek }  // "{n} ⌄" back pill peeks right
         if s.frontHovered && !s.dropdownOpen { bottom -= kFrontPeek }  // title-peek strip stays clickable
         if s.dropdownOpen {
             right = left + curPillWidth + sheetSide     // sheet grows right…
@@ -1831,7 +2150,6 @@ final class AppController: NSObject, NSApplicationDelegate {
         hiddenIdle = true
         stopLivePoll()   // nothing to poll while dark
         let s = IslandState.shared
-        let prevCount = s.idleSessionCount
         s.idleSessionCount = idleCount
         s.aggregate = false
         s.detail = ""
@@ -1841,29 +2159,19 @@ final class AppController: NSObject, NSApplicationDelegate {
         s.idleHint = false
         s.mode = .idle
 
-        if idleCount >= 1 {
-            // Persistent count pill: keep the roster (+ grouped rows) for the hover-dropdown.
-            let wasShown = idlePeekShown
-            idlePeekShown = true
+        // Idle is a HIDDEN regime: the island leaves the notch entirely regardless of how many
+        // tabs remain idle/stale — no persistent pill. A notch hover (1s dwell) re-reveals a
+        // resting pill: plain "Idle", or the "{n} idle sessions" list when tabs remain. Keep the
+        // roster in that case so the reveal can drop the list; only the no-session peek wipes it.
+        if idleCount == 0 { s.cards = []; s.roster = [] }
+
+        // Don't yank a peek the user is actively hovering: if the resting pill is already
+        // revealed, hold it up (just refresh width/count) — a routine rebuild mustn't tear it
+        // down out from under the cursor. It hides on its own once the cursor leaves.
+        if idlePeekShown {
             (curPillWidth, curIslandOffset) = idleGeom(primary: "", right: idleRightLabel())
-            position()
-            panel.orderFrontRegardless()
-            if wasShown {
-                s.idleReveal = 1                     // already up — just hold it
-            } else {
-                s.idleReveal = 0                     // first entry: bouncy spring-in
-                DispatchQueue.main.async { IslandState.shared.idleReveal = 1 }
-            }
             return
         }
-
-        // No idle sessions (idleCount == 0) → hide the panel; a notch hover still peeks "Idle".
-        // A transient hover-peek (prevCount was already 0) stays up until the cursor leaves; a
-        // persistent pill whose last tab just closed (prevCount ≥ 1) is torn down immediately.
-        if idlePeekShown && prevCount == 0 { return }
-        idlePeekShown = false
-        s.cards = []
-        s.roster = []
         s.idleReveal = 0          // collapsed; springs to 1 on the hover-reveal
         (curPillWidth, curIslandOffset) = idleGeom(primary: "", right: idleRightLabel())
         panel.orderOut(nil)
@@ -1881,9 +2189,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         s.aggregate = false
         s.dropdownOpen = false
         s.frontHovered = false
-        // Keep the roster (+ rows) when there's a "{n} idle sessions" list to drop on hover;
-        // only wipe in the no-list case (the resting "Idle" pill).
-        if s.idleSessionCount <= 1 {
+        // Keep the roster (+ rows) when there's a "{n} idle sessions" list to drop on hover
+        // (incl. a single idle tab → "1 idle session"); only wipe in the no-list resting "Idle".
+        if s.idleSessionCount == 0 {
             s.cards = []
             s.roster = []
         }
@@ -1939,7 +2247,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// menu). Geometry mirrors the right edge used by `pointInIslandHitArea`.
     private func pointInBackPillPeek(_ p: NSPoint) -> Bool {
         let s = IslandState.shared
-        guard s.roster.count > 1 else { return false }
+        guard s.roster.count >= 1 else { return false }
         let f = panel.frame
         let islandH = max(s.notchHeight, 30)
         let pillRight = f.midX + curIslandOffset + curPillWidth / 2
@@ -2052,9 +2360,9 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     private static func bucketModes(_ bucket: String) -> Set<String> {
         switch bucket {
-        case "running":   return ["working", "thinking", "compacting", "compacted", "struggling"]
+        case "running":   return ["working", "thinking", "compacting", "struggling"]
         case "attention": return ["attention"]
-        case "done":      return ["done", "declined", "interrupted"]
+        case "done":      return ["done", "declined", "interrupted", "compacted"]
         case "error":     return ["error"]
         default:          return []
         }
@@ -2113,6 +2421,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         let items = s.dropdownItems
         guard s.dropdownOpen, !items.isEmpty else {
             if s.hoveredRow != nil { s.hoveredRow = nil }
+            if s.hoveredGroup != nil { s.hoveredGroup = nil }
             if s.hoveredRing != nil { s.hoveredRing = nil }
             return
         }
@@ -2125,6 +2434,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         let contentTop = f.maxY - islandH - kDropdownVPad
         guard p.x >= leftEdge, p.x <= rightEdge, p.y <= contentTop, p.y >= contentTop - dropdownContentHeight(items) else {
             if s.hoveredRow != nil { setRow(nil) }
+            if s.hoveredGroup != nil { s.hoveredGroup = nil }
             if s.hoveredRing != nil { s.hoveredRing = nil }
             return
         }
@@ -2132,8 +2442,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         for item in items {
             let h = item.isHeader ? kHeaderHeight : kRowHeight
             if p.y <= y, p.y > y - h {
-                let id = item.card?.id            // nil over a header → clears hover
+                let id = item.card?.id            // nil over a header → clears the ROW hover
                 if s.hoveredRow != id { setRow(id) }
+                // Group hover lights the matching header's branch — set whether the cursor is on
+                // a row OR its header, so the highlight is robust to row/header hit-test drift.
+                let grp = item.isHeader ? String(item.id.dropFirst(4)) : item.card?.groupKey   // "hdr:" == 4
+                if s.hoveredGroup != grp { s.hoveredGroup = grp }
                 // The ring sits LEFT of the (variable-width) timer: trailing pad (12), then
                 // the timer, then a 10px gap, then the 12px ring. Locate that band.
                 let overRing: Bool = item.card.map { card in
@@ -2149,6 +2463,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             y -= h
         }
         if s.hoveredRow != nil { setRow(nil) }
+        if s.hoveredGroup != nil { s.hoveredGroup = nil }
         if s.hoveredRing != nil { s.hoveredRing = nil }
     }
 
@@ -2427,6 +2742,10 @@ final class AppController: NSObject, NSApplicationDelegate {
             return
         }
 
+        // Probe git context (repo/branch/churn) for the visible cwds — drives the dropdown's
+        // repo/branch grouping + header churn. No-op unless the dropdown is open (throttled).
+        refreshGitInfo(Set(vis.values.map(\.cwd).filter { !$0.isEmpty }))
+
         // Front pill: a clicked tab wins (pinned until the next prompt), else the most
         // recently prompted, else the most recent activity. All candidates have really
         // run, so the front pill is always a genuine activity state — never a bare tab.
@@ -2438,17 +2757,44 @@ final class AppController: NSObject, NSApplicationDelegate {
         // even if a different tab finished more recently. Watching the one thing that's
         // working beats narrating counts. The live timer follows frontUUID, so making it the
         // front is what keeps that timer ticking on the running tab.
-        let runningKeys = vis.filter { ["working", "thinking", "compacting", "compacted", "struggling"].contains($0.value.mode) }.map(\.key)
+        // A done-family session whose background delegate (a Task/subagent it spun up) is still
+        // live keeps reading as "working": the parent's Stop fired, but the subagent outlives the
+        // turn and fires no hooks of its own. Checked only for finished sessions (cheap, few of
+        // them) and NOT written back into the stored model — so when the delegate's transcript
+        // ages out past kSubagentFreshS this self-heals to the real "done" with its final message.
+        let doneFamily: Set<String> = ["done", "declined", "interrupted", "compacted"]
+        let delegating = Set(vis.filter { doneFamily.contains($0.value.mode) && liveSubagentCount($0.value) > 0 }.map(\.key))
+        let runModes: Set<String> = ["working", "thinking", "compacting", "struggling"]
+        func effMode(_ k: String, _ v: LiveSession) -> String { delegating.contains(k) ? "working" : v.mode }
+        func isRunning(_ k: String, _ v: LiveSession) -> Bool { runModes.contains(effMode(k, v)) }
+
+        let runningKeys = vis.filter { isRunning($0.key, $0.value) }.map(\.key)
         let needYouLive = vis.contains { $0.value.mode == "attention" }
         let focusedRunning = runningKeys.count == 1 && !needYouLive
 
+        let now = Date().timeIntervalSince1970
         let newestTs = vis.values.map { $0.ts }.max() ?? 0
         if let c = clickFocus, vis[c] == nil || newestTs > clickFocusTs {
             clickFocus = nil
         }
+        // Remember the lone running tab so its completion can keep the single pill.
+        if focusedRunning { lastSingleFocus = runningKeys[0] }
+        // The lone session we were watching just finished and nothing else is running or waiting
+        // → keep IT fronted as a single "Finished" pill (the most recent thing that happened),
+        // instead of flipping to a "{n} done" aggregate. Releases once another tab runs, a newer
+        // completion lands elsewhere, or this one goes stale (>15 min).
+        let focusedDone: Bool = {
+            guard !focusedRunning, !needYouLive, runningKeys.isEmpty,
+                  let k = lastSingleFocus, let v = vis[k],
+                  doneFamily.contains(v.mode), now - v.ts <= 900 else { return false }
+            return v.ts >= newestTs
+        }()
+
         let front: String
         if focusedRunning {
             front = runningKeys[0]
+        } else if focusedDone {
+            front = lastSingleFocus!
         } else if let c = clickFocus, vis[c] != nil {
             front = c
         } else {
@@ -2458,15 +2804,14 @@ final class AppController: NSObject, NSApplicationDelegate {
             // not whatever merely posted activity most recently. With several running and
             // nothing waiting, that's the most recently active running tab (the dropdown
             // still lists them all).
-            let runModes: Set<String> = ["working", "thinking", "compacting", "compacted", "struggling"]
-            let buckets: [(LiveSession) -> Bool] = [
-                { $0.mode == "attention" },
-                { runModes.contains($0.mode) },
-                { $0.mode == "done" },
-                { $0.mode == "error" },
+            let buckets: [(String, LiveSession) -> Bool] = [
+                { _, v in v.mode == "attention" },
+                { k, v in isRunning(k, v) },
+                { k, v in doneFamily.contains(effMode(k, v)) },
+                { _, v in v.mode == "error" },
             ]
-            func freshest(_ pred: (LiveSession) -> Bool) -> String? {
-                vis.filter { pred($0.value) }
+            func freshest(_ pred: (String, LiveSession) -> Bool) -> String? {
+                vis.filter { pred($0.key, $0.value) }
                    .max(by: { ($0.value.promptTs, $0.value.ts) < ($1.value.promptTs, $1.value.ts) })?.key
             }
             front = buckets.lazy.compactMap(freshest).first
@@ -2475,12 +2820,15 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         frontUUID = front
         let f = vis[front]!
+        // A delegating front shows live "Delegating…" rather than its parked done state.
+        let frontMode = effMode(front, f)
+        let frontDetail = delegating.contains(front) && f.detail.isEmpty ? "Delegating…" : f.detail
 
         let state = IslandState.shared
         // declined has no Mode case (it's a dropdown-only flavor of "finished"); the front
         // single pill treats it like done.
-        state.mode = IslandState.Mode(rawValue: f.mode) ?? (["declined", "interrupted"].contains(f.mode) ? .done : .working)
-        state.detail = f.detail
+        state.mode = IslandState.Mode(rawValue: frontMode) ?? (["declined", "interrupted"].contains(frontMode) ? .done : .working)
+        state.detail = frontDetail
         state.ultra = f.ultra
         state.preview = f.preview
         state.project = f.project
@@ -2488,29 +2836,46 @@ final class AppController: NSObject, NSApplicationDelegate {
         // surfaced by the on-hover front-pill peek.
         state.title = f.aiTitle.isEmpty ? f.project : f.aiTitle
         state.lastUserMsg = f.lastUserMsg
-        state.contextPct = f.context
+        state.contextPct = statuslineContext(f.transcript) ?? f.context
         state.focusURL = f.focus
 
         // Back cards: the other live sessions, most-recent first. The uuid breaks ties
         // deterministically so equal-timestamp cards keep a STABLE order — otherwise the
         // dictionary's random iteration order reshuffles them every rebuild (the
         // "carousel" rotation). A done card stays green for 15 min, then greys (stale).
-        let now = Date().timeIntervalSince1970
         // Highlighted dropdown row = the tab currently focused in Warp (from Warp's DB),
         // falling back to the front session when unknown. Highlight only — never re-fronts.
         let selected = (activeWarpTab.flatMap { liveTabs.contains($0) ? $0 : nil }) ?? front
+        // The selected session's group is the resting "expanded" header (full churn, white) when
+        // nothing is hovered — so exactly one header always carries the detail.
+        let selKey = vis[selected] != nil ? selected : front
+        if let sv = vis[selKey] {
+            let g = gitGroup(sv.cwd, sv.project)
+            state.selectedGroup = g.branch.isEmpty ? g.repo : g.repo + "/" + g.branch
+            state.selectedId = selKey
+        } else { state.selectedGroup = nil; state.selectedId = nil }
         func makeCard(_ k: String, _ v: LiveSession) -> SessionCard {
-            let status = (["done", "declined", "interrupted"].contains(v.mode) && now - v.ts > 900) ? "stale" : v.mode
+            // Effective mode: a finished session with a still-live delegate reads as "working".
+            let em = effMode(k, v)
+            // A finished session (done/declined/interrupted/compacted) greys to "stale" after 15 min.
+            let status = (doneFamily.contains(em) && now - v.ts > 900) ? "stale" : em
             // Show a turn timer for active (working/thinking) and finished (done/stale)
             // sessions; formatElapsed ticks live for active and freezes at ts for done.
-            let showTimer = ["working", "thinking", "done", "struggling"].contains(v.mode) || status == "stale"
+            let showTimer = ["working", "thinking", "done", "struggling"].contains(em) || status == "stale"
+            let verb = delegating.contains(k) && v.detail.isEmpty ? "Delegating…" : v.detail
             var card = SessionCard(id: k, project: v.project,
                                title: v.aiTitle.isEmpty ? v.project : v.aiTitle,
-                               status: status, verb: v.detail, focus: v.focus, isSelected: k == selected,
+                               status: status, verb: verb, focus: v.focus, isSelected: k == selected,
                                elapsed: showTimer ? formatElapsed(v) : "",
-                               context: v.context, preview: v.preview, firstPrompt: v.firstPrompt,
+                               context: self.statuslineContext(v.transcript) ?? v.context,
+                               preview: v.preview, firstPrompt: v.firstPrompt,
                                qHeader: v.qHeader, qText: v.qText)
+            card.lastUserMsg = v.lastUserMsg
             card.ultra = v.ultra
+            // Git context for repo/branch grouping + header churn (cache lookup; bg-probed).
+            let g = self.gitGroup(v.cwd, v.project)
+            card.repo = g.repo; card.branch = g.branch
+            card.files = g.files; card.added = g.added; card.removed = g.removed
             // Only count the subagents/ tree while the dropdown is open (keeps the disk reads
             // off the hot path otherwise). Not gated on the parent's mode: background/async
             // delegates can outlive the parent's turn, so count any that are still live.
@@ -2553,8 +2918,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         // to disk so it reflects when each tab was first opened and survives restarts. A new
         // project is appended (oldest stays on top, new tabs land at the bottom) and never
         // reshuffles afterward. A batch first seen together is tie-broken by ascending ts.
-        let projFirstTs = Dictionary(grouping: all.values, by: { $0.project.isEmpty ? "Claude Code" : $0.project })
-            .mapValues { $0.map(\.ts).min() ?? 0 }
+        let projFirstTs = Dictionary(grouping: all.values, by: { sess -> String in
+            let g = self.gitGroup(sess.cwd, sess.project)
+            return g.branch.isEmpty ? g.repo : g.repo + "/" + g.branch
+        }).mapValues { $0.map(\.ts).min() ?? 0 }
         var orderGrew = false
         for proj in projFirstTs.keys.sorted(by: { (projFirstTs[$0]!, $0) < (projFirstTs[$1]!, $1) })
         where !projectOrder.contains(proj) { projectOrder.append(proj); orderGrew = true }
@@ -2571,7 +2938,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         // The 1s clock runs while ANY visible session is mid-turn, so every active row's
         // timer in the dropdown ticks live — not just the front pill's.
-        let anyActive = vis.values.contains { $0.mode == "working" || $0.mode == "thinking" }
+        // Delegating sessions (parent done, subagent still live) count as active too — otherwise
+        // the clock/poll stops and the overlay never re-evaluates when the delegate finishes.
+        let anyActive = vis.contains { $0.value.mode == "working" || $0.value.mode == "thinking" || delegating.contains($0.key) }
         // The 1s timer and the sub-second live poll both run ONLY while a turn is active.
         if anyActive { startClock(); startLivePoll() } else { stopClock(); stopLivePoll() }
 
@@ -2582,9 +2951,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         // the one thing you can act on. An errored turn is terminal and not actionable, so
         // it gets its own bucket and never reads as "need you". Aggregate kicks in once ≥2
         // sessions have actually run.
-        let running = state.roster.filter { ["working", "thinking", "compacting", "compacted", "struggling"].contains($0.status) }.count
+        let running = state.roster.filter { ["working", "thinking", "compacting", "struggling"].contains($0.status) }.count
         let needYou = state.roster.filter { $0.status == "attention" }.count
-        let done = state.roster.filter { ["done", "declined", "interrupted"].contains($0.status) }.count
+        let done = state.roster.filter { ["done", "declined", "interrupted", "compacted"].contains($0.status) }.count
         let errored = state.roster.filter { $0.status == "error" }.count
         state.runningCount = running
         state.needYouCount = needYou
@@ -2592,7 +2961,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         state.errorCount = errored
         // ≥2 sessions that have run → count aggregate, UNLESS a single running tab has claimed
         // the front for its full live activity (then show that, not the counts).
-        state.aggregate = !focusedRunning && (running + needYou + done + errored) >= 2
+        state.aggregate = !focusedRunning && !focusedDone && (running + needYou + done + errored) >= 2
 
         // Nothing live, waiting, or errored (all stale / idle) → hide the island entirely.
         if running + needYou + done + errored == 0 {
@@ -3154,13 +3523,52 @@ final class AppController: NSObject, NSApplicationDelegate {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             let u = self.computeUsage()
+            let rl = self.readRateLimits()
             DispatchQueue.main.async {
                 IslandState.shared.usageSession = u.session
                 IslandState.shared.usageToday = u.today
+                IslandState.shared.rlSession = rl.session
+                IslandState.shared.rlWeek = rl.week
+                IslandState.shared.rlSessionReset = rl.sessionReset
+                IslandState.shared.rlWeekReset = rl.weekReset
                 self.lastUsageCompute = Date().timeIntervalSince1970
                 self.usageComputing = false
             }
         }
+    }
+
+    /// Read the real plan rate-limit % that island-statusline.py captured from Claude Code's
+    /// statusline JSON. Returns ("","") when the file is missing or stale (older than the 5h
+    /// window, so a since-reset value isn't shown as current). Each window is independent.
+    private func readRateLimits() -> (session: String, week: String, sessionReset: Double, weekReset: Double) {
+        let path = NSString("~/.claude-island/rate-limits.json").expandingTildeInPath
+        guard let data = FileManager.default.contents(atPath: path),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return ("", "", 0, 0) }
+        let now = Date().timeIntervalSince1970
+        if let ts = obj["ts"] as? Double, now - ts > 6 * 3600 { return ("", "", 0, 0) }   // stale
+        func win(_ key: String) -> (String, Double) {
+            guard let w = obj[key] as? [String: Any],
+                  let p = (w["used_percentage"] as? NSNumber)?.doubleValue else { return ("", 0) }
+            return ("\(Int(p.rounded()))", (w["resets_at"] as? NSNumber)?.doubleValue ?? 0)
+        }
+        let f = win("five_hour"), s = win("seven_day")
+        return (f.0, s.0, f.1, s.1)
+    }
+
+    /// CC's real context-window fill (0…1) for a session, captured per-session by
+    /// island-statusline.py and keyed by session_id (the transcript's basename). This is
+    /// computed against the session's ACTUAL window — model- and 1M-beta-aware — so it's used in
+    /// preference to the daemon's 200k/1M token-count heuristic. nil when not yet captured.
+    private func statuslineContext(_ transcript: String) -> Double? {
+        guard transcript.hasSuffix(".jsonl") else { return nil }
+        let sid = String((transcript as NSString).lastPathComponent.dropLast(6))   // ".jsonl"
+        guard !sid.isEmpty else { return nil }
+        let path = ("~/.claude-island/ctx/\(sid).json" as NSString).expandingTildeInPath
+        guard let data = FileManager.default.contents(atPath: path),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let pct = (obj["pct"] as? NSNumber)?.doubleValue else { return nil }
+        return max(0, min(1, pct / 100.0))
     }
 
     /// Scan transcripts touched in the last 7d, summing input+output tokens per hour-bucket, then
@@ -3261,6 +3669,83 @@ final class AppController: NSObject, NSApplicationDelegate {
         rebuildDropdownItems()   // keep grouped view's timers in sync (respecting any active filter)
     }
 
+    // MARK: - Git context (local probe, per session cwd; dropdown groups by repo/branch)
+
+    struct GitInfo: Equatable { var repo = ""; var branch = ""; var files = 0; var added = 0; var removed = 0 }
+    private var gitCache: [String: GitInfo] = [:]   // cwd → its repo/branch/churn
+    private var lastGitCompute = 0.0
+    private var gitProbing = false
+
+    /// Cache-backed git context for a session's cwd, falling back to the bare dir name pre-probe
+    /// (or for a non-git dir) so grouping still works. Pure lookup — the probe runs in the bg.
+    private func gitGroup(_ cwd: String, _ project: String) -> GitInfo {
+        if var g = gitCache[cwd] {
+            if g.repo.isEmpty { g.repo = project.isEmpty ? "Claude Code" : project }
+            return g
+        }
+        return GitInfo(repo: project.isEmpty ? "Claude Code" : project)
+    }
+
+    /// One `git` probe for a cwd: repo name (shared across a repo's worktrees, via the common
+    /// git dir so a linked worktree maps to the same repo prefix), current branch, and the
+    /// uncommitted churn vs HEAD. Returns nil for a non-git dir. Runs off the main thread.
+    private func probeGit(_ cwd: String) -> GitInfo? {
+        guard !cwd.isEmpty else { return nil }
+        let common = shell("/usr/bin/git", ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard common.hasPrefix("/") else { return nil }   // empty/relative/error → not a repo
+        // common is "<repoRoot>/.git" (or a worktrees subpath under it); the repo name is the
+        // parent dir of the shared .git, identical for the main tree and every linked worktree.
+        let repo = ((common as NSString).deletingLastPathComponent as NSString).lastPathComponent
+        let branch = shell("/usr/bin/git", ["-C", cwd, "branch", "--show-current"])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        var files = 0, added = 0, removed = 0
+        // Tracked changes vs HEAD (staged + unstaged).
+        for line in shell("/usr/bin/git", ["-C", cwd, "diff", "HEAD", "--numstat"]).split(separator: "\n") {
+            let c = line.split(separator: "\t")
+            guard c.count >= 2 else { continue }
+            files += 1
+            added += Int(c[0]) ?? 0       // "-" (binary) → 0
+            removed += Int(c[1]) ?? 0
+        }
+        // Untracked (new, non-ignored) files count as additions too — `git diff HEAD` omits them,
+        // which made the island undercount vs Warp / `git status`. Each new file = its line count.
+        let others = shell("/usr/bin/git", ["-C", cwd, "ls-files", "--others", "--exclude-standard", "-z"])
+        for name in others.split(separator: "\0") where !name.isEmpty {
+            guard files < 500,
+                  let data = FileManager.default.contents(atPath: cwd + "/" + name),
+                  data.count <= 1_000_000 else { continue }   // skip huge files
+            var nl = 0, binary = false
+            for b in data { if b == 0 { binary = true; break }; if b == 0x0A { nl += 1 } }
+            if binary { continue }        // don't count binary blobs (images, etc.)
+            files += 1
+            added += nl
+        }
+        return GitInfo(repo: repo, branch: branch.isEmpty ? "detached" : branch,
+                       files: files, added: added, removed: removed)
+    }
+
+    /// Refresh git context for the visible sessions' cwds. Gated on the dropdown being open
+    /// (the repo/branch headers only render there) and throttled, like the subagent count, to
+    /// keep `git` off the hot path. On a real change it triggers one rebuild to repaint.
+    private func refreshGitInfo(_ cwds: Set<String>) {
+        let now = Date().timeIntervalSince1970
+        guard IslandState.shared.dropdownOpen, !gitProbing, now - lastGitCompute > 3, !cwds.isEmpty else { return }
+        gitProbing = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            var fresh: [String: GitInfo] = [:]
+            for cwd in cwds { if let g = self.probeGit(cwd) { fresh[cwd] = g } }
+            DispatchQueue.main.async {
+                var changed = false
+                for (k, v) in fresh where self.gitCache[k] != v { self.gitCache[k] = v; changed = true }
+                self.lastGitCompute = Date().timeIntervalSince1970
+                self.gitProbing = false
+                if changed { self.rebuild() }
+            }
+        }
+    }
+
     // MARK: - Subagents (counted straight from the transcript tree; hooks never see them)
 
     /// How many subagents a session has running right now. Claude Code fires no hooks for a
@@ -3289,24 +3774,37 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// group. Headers are emitted only when more than one project is present.
     static func groupRoster(_ roster: [SessionCard], order persistentOrder: [String]) -> [DropdownItem] {
         var groups: [String: [SessionCard]] = [:]
-        for c in roster {
-            let key = c.project.isEmpty ? "Claude Code" : c.project
-            groups[key, default: []].append(c)
+        for c in roster { groups[c.groupKey, default: []].append(c) }
+        // Cluster by repo (dirname) so all of a repo's branches/worktrees stay CONTIGUOUS —
+        // otherwise a different dir, first-seen between two of this repo's branches, would split
+        // them apart. Repos order by first-seen; branches within a repo order by first-seen.
+        func repoOf(_ k: String) -> String { k.firstIndex(of: "/").map { String(k[..<$0]) } ?? k }
+        let rank = Dictionary(persistentOrder.enumerated().map { ($1, $0) }, uniquingKeysWith: { a, _ in a })
+        // Repo first-seen = earliest rank among THIS repo's CURRENT group keys only, so stale
+        // plain-name entries left in the persisted order (from before grouping existed) can't drag
+        // a repo's position around.
+        var repoRank: [String: Int] = [:]
+        for k in groups.keys {
+            repoRank[repoOf(k)] = min(repoRank[repoOf(k)] ?? Int.max, rank[k] ?? Int.max)
         }
-        // Group (dir) order follows the persistent first-seen order so headers never
-        // reshuffle when a session becomes active. Any project not yet recorded (shouldn't
-        // happen, but be safe) is appended at the end. Rows within a group keep ts order.
-        var order = persistentOrder.filter { groups[$0] != nil }
-        for key in groups.keys where !order.contains(key) { order.append(key) }
-        // Headers appear once the list holds more than one session (n=1 → a flat, label-less
-        // row; n>1 → grouped under project headers, even a project with a single session).
-        let showHeaders = roster.count > 1
+        let order = groups.keys.sorted { a, b in
+            let ra = repoRank[repoOf(a)] ?? Int.max, rb = repoRank[repoOf(b)] ?? Int.max
+            if ra != rb { return ra < rb }                       // repo, by first-seen
+            let ka = rank[a] ?? Int.max, kb = rank[b] ?? Int.max
+            return ka != kb ? ka < kb : a < b                    // branch within repo, by first-seen
+        }
+        // Always show the repo/branch header — it's the primary "which session is this" anchor now
+        // (even a lone session gets its "dirname · branch · churn" label).
+        let showHeaders = true
         var items: [DropdownItem] = []
         for key in order {
-            if showHeaders { items.append(DropdownItem(id: "hdr:\(key)", header: key, card: nil)) }
-            for c in groups[key]! {
-                items.append(DropdownItem(id: c.id, header: nil, card: c))
+            let cards = groups[key]!
+            if showHeaders, let head = cards.first {
+                items.append(DropdownItem(id: "hdr:\(key)", header: key, card: nil,
+                    hRepo: head.repo.isEmpty ? head.project : head.repo, hBranch: head.branch,
+                    hFiles: head.files, hAdded: head.added, hRemoved: head.removed))
             }
+            for c in cards { items.append(DropdownItem(id: c.id, header: nil, card: c)) }
         }
         return items
     }
